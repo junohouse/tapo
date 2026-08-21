@@ -1,0 +1,48 @@
+[package]
+name = "juno-driver-tapo"
+version = "1.0.0"
+edition = "2024"
+description = "TP-Link Tapo dimmer switches over the local KLAP protocol"
+publish = false
+
+[lib]
+name = "juno_driver_tapo"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The SDK re-exports core's types, so the two are one unit: a driver built against a
+# different core than it runs on is refused by the ABI check rather than half-understood.
+# Tracks `main`. No tags while the contracts are still moving.
+driver-sdk = { git = "https://github.com/junohouse/driver-sdk", branch = "main" }
+
+# Working on core and this driver at once: point the SDK at a local checkout.
+#   [patch."https://github.com/junohouse/driver-sdk"]
+#   driver-sdk = { path = "../../driver-sdk" }
+
+# KLAP's whole cryptographic vocabulary, and no more of it: SHA-1 and SHA-256 for the
+# credential hash and the handshake, AES-128-CBC for the session. It lives here rather than in
+# core for the reason Apple TV's ChaCha20 does — this is one vendor's protocol, and vendor
+# knowledge is the driver's.
+sha1 = { version = "0.10", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+aes = { version = "0.8", default-features = false }
+cbc = { version = "0.1", default-features = false, features = ["alloc", "block-padding"] }
+# The handshake's local seed. A driver that cannot ask for entropy would send the same seed on
+# every connection, which turns a session key into a constant.
+getrandom = "0.2"
+
+# Its own repo, so its own workspace root. Without this, a checkout sitting inside another
+# workspace is claimed by that workspace and refuses to build.
+[workspace]
+
+# A driver is a dylib the controller loads, and it is downloaded and kept per project — so it
+# is tuned for size rather than for the last few percent of speed. A driver spends its time
+# waiting on a device, not in its own code.
+#
+# `panic = "abort"` is deliberately NOT here. `export_driver!` wraps dispatch in `catch_unwind`
+# so a driver that panics reports a warning instead of taking the controller down with it.
+[profile.release]
+opt-level = "z"
+codegen-units = 1
+lto = true
+strip = true

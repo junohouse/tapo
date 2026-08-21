@@ -1,0 +1,19 @@
+# Push to main for a beta, tag v1.2.3 for a release. Everything else is inherited.
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  # Rebuild without a commit — for when what changed is the SDK or core, not this driver.
+  workflow_dispatch:
+
+jobs:
+  driver:
+    uses: junohouse/driver-ci/.github/workflows/certified.yml@main
+    # The public build job this calls declares contents: write, and a called workflow
+    # cannot be granted more than its caller has.
+    permissions:
+      contents: write
+    # Same organization now, so inheriting is not an export across an org boundary.
+    secrets: inherit

@@ -1,0 +1,77 @@
+[driver]
+id = "tapo.dimmer"
+name = "Tapo Dimmer Switch"
+manufacturer = "TP-Link"
+version = "1.0.0"
+runtime = "wasm"
+primary = true
+
+# One load, dimmed. `supports_ramp` is deliberately absent: the switch has a fade time, but it
+# is a setting stored on the device rather than something a single command can carry, so a
+# `ramp_ms` accepted here would be quietly ignored — which is the failure that flag exists to
+# prevent. `has_button_events` likewise: the paddle works, and nothing local reports that it
+# was pressed, so a rule triggered on a press would never fire.
+#
+# 1 rather than 0 for `min_on_level` because that is what the hardware takes — `brightness: 0`
+# is refused, and off is `device_on: false`. See `set_level` in the driver.
+[[proxy]]
+id = 1
+type = "light"
+primary = true
+name = "Dimmer"
+capabilities = { dimmer = true, min_on_level = 1, max_on_level = 100 }
+
+# KLAP is HTTP on port 80, but the bodies are raw seeds and AES ciphertext and the session id
+# arrives in a `Set-Cookie` — none of which survives `HostCall::Http`, whose body is a `String`
+# both ways and which does not hand a driver the response headers. So this is a held connection
+# carrying framed bytes, and `src/http.rs` owns the framing. See its module doc.
+#
+# No `keepalive`: it would have core replay the last thing written whenever the socket drops,
+# and the last thing written here is as likely to be `set_device_info` as a handshake. A light
+# that turns itself on when a connection blips is worse than a command that has to be retried.
+[[transport]]
+kind = "network"
+port = 80
+binary = true
+# What finds one of these on a network it does not announce itself on. Handshake1 is the ideal
+# knock and is exactly the exchange `Probe` describes: it needs no credentials, it grants
+# nothing — the reply proves only that the *device* holds an account, and the seed below is a
+# constant precisely because nothing is done with what comes back — and a Tapo answers it by
+# opening a session, which is what puts `TP_SESSIONID` in the headers. Nothing else on port 80
+# in a house sends that cookie name, so a web server that answers is not mistaken for a switch.
+#
+# The body must be 16 bytes; these are 16 printable ones because a probe is declared as text.
+probe = { send = "POST /app/handshake1 HTTP/1.1\r\nHost: juno\r\nContent-Type: application/octet-stream\r\nContent-Length: 16\r\nConnection: close\r\n\r\njuno-discovery!!", expect = "TP_SESSIONID" }
+
+[[property]]
+name = "Address"
+type = "string"
+required = true
+tooltip = "IP address of the dimmer. The Tapo app shows it under the device's Settings → Device Info."
+
+# The TP-Link account, not a per-device secret and not the Wi-Fi password. The switch stores a
+# hash of these when the app sets it up, and local control is checked against that — so there
+# is no pairing flow here to issue a token, and nothing to revoke afterwards.
+[[property]]
+name = "Email"
+type = "string"
+required = true
+tooltip = "The TP-Link account the dimmer is paired to."
+
+[[property]]
+name = "Password"
+type = "password"
+required = true
+tooltip = "That account's password. Local control is checked against it — the dimmer never asks the cloud."
+
+# A Tapo tells nobody when somebody turns it up at the wall: there is no local subscription and
+# no unsolicited push, only an answer to a question. Without this its brightness is whatever it
+# was when the controller started, forever.
+[[property]]
+name = "Poll interval"
+type = "ranged_int"
+min = 5
+max = 900
+default = 30
+unit = "s"
+tooltip = "How often to ask the dimmer where it stands. Local, so this can be seconds."
