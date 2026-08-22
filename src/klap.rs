@@ -9,6 +9,10 @@
 //!   POST /app/request?seq=N   SHA256(sig || seq || ciphertext) || ciphertext
 //! ```
 //!
+//! The primitives — SHA-1, SHA-256, AES-128-CBC — come from `driver_sdk::crypto`. What is
+//! KLAP's own and lives here is the order they are combined in: which bytes get hashed
+//! together, in what order, and how a session key comes out of them.
+//!
 //! # The device proves it knows the password first
 //!
 //! `server_hash` is `SHA256(local_seed || remote_seed || auth_hash)` computed by the switch
@@ -26,29 +30,22 @@
 //! MD5 instead. Not implemented: every Tapo dimmer shipped with v2, and a fallback that
 //! cannot be tested against hardware is a second protocol to be wrong about.
 
-use aes::Aes128;
-use aes::cipher::block_padding::Pkcs7;
-use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
-use sha1::Sha1;
-use sha2::{Digest, Sha256};
-
-type Encryptor = cbc::Encryptor<Aes128>;
-type Decryptor = cbc::Decryptor<Aes128>;
+use driver_sdk::crypto::{aes128_cbc_decrypt, aes128_cbc_encrypt, sha1, sha256 as sha256_of};
 
 /// What the switch checks a login against: the TP-Link account, hashed the way KLAP v2 wants.
 pub fn auth_hash(email: &str, password: &str) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(Sha1::digest(email.as_bytes()));
-    h.update(Sha1::digest(password.as_bytes()));
-    h.finalize().into()
+    sha256(&[&sha1(email.as_bytes()), &sha1(password.as_bytes())])
 }
 
+/// SHA-256 of several pieces concatenated — KLAP hashes a handful of byte strings together
+/// wherever it needs a hash at all, and this is the one place that concatenation happens
+/// rather than at each call site.
 fn sha256(parts: &[&[u8]]) -> [u8; 32] {
-    let mut h = Sha256::new();
+    let mut buf = Vec::new();
     for p in parts {
-        h.update(p);
+        buf.extend_from_slice(p);
     }
-    h.finalize().into()
+    sha256_of(&buf)
 }
 
 /// A fresh local seed. 16 bytes, and they must be unpredictable — they are half of what the
@@ -127,8 +124,7 @@ impl Session {
         // Wrapping rather than saturating: the device wraps, and a session that pinned itself
         // at i32::MAX would stop matching after two billion commands rather than carrying on.
         self.seq = self.seq.wrapping_add(1);
-        let ciphertext = Encryptor::new(&self.key.into(), &self.block_iv(self.seq).into())
-            .encrypt_padded_vec_mut::<Pkcs7>(plain);
+        let ciphertext = aes128_cbc_encrypt(&self.key, &self.block_iv(self.seq), plain);
         let mut body = sha256(&[&self.sig, &self.seq.to_be_bytes(), &ciphertext]).to_vec();
         body.extend_from_slice(&ciphertext);
         (self.seq, body)
@@ -149,9 +145,7 @@ impl Session {
         if body.len() <= 32 {
             return None;
         }
-        Decryptor::new(&self.key.into(), &self.block_iv(seq).into())
-            .decrypt_padded_vec_mut::<Pkcs7>(&body[32..])
-            .ok()
+        aes128_cbc_decrypt(&self.key, &self.block_iv(seq), &body[32..])
     }
 }
 

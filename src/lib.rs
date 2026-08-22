@@ -1048,13 +1048,11 @@ mod tests {
 
     /// The switch's half of handshake1, computed the way the device computes it.
     fn hs1_reply(local: &[u8; 16], remote: &[u8; 16], auth: &[u8; 32]) -> Vec<u8> {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(local);
-        h.update(remote);
-        h.update(auth);
+        let mut buf = local.to_vec();
+        buf.extend_from_slice(remote);
+        buf.extend_from_slice(auth);
         let mut out = remote.to_vec();
-        out.extend_from_slice(&h.finalize());
+        out.extend_from_slice(&driver_sdk::crypto::sha256(&buf));
         out
     }
 

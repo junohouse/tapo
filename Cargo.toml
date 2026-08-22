@@ -13,20 +13,18 @@ crate-type = ["cdylib", "rlib"]
 # The SDK re-exports core's types, so the two are one unit: a driver built against a
 # different core than it runs on is refused by the ABI check rather than half-understood.
 # Tracks `main`. No tags while the contracts are still moving.
-driver-sdk = { git = "https://github.com/junohouse/driver-sdk", branch = "main" }
+driver-sdk = { git = "https://github.com/junohouse/driver-sdk", branch = "main", features = ["crypto"] }
 
 # Working on core and this driver at once: point the SDK at a local checkout.
 #   [patch."https://github.com/junohouse/driver-sdk"]
 #   driver-sdk = { path = "../../driver-sdk" }
 
-# KLAP's whole cryptographic vocabulary, and no more of it: SHA-1 and SHA-256 for the
-# credential hash and the handshake, AES-128-CBC for the session. It lives here rather than in
-# core for the reason Apple TV's ChaCha20 does — this is one vendor's protocol, and vendor
-# knowledge is the driver's.
-sha1 = { version = "0.10", default-features = false }
-sha2 = { version = "0.10", default-features = false }
-aes = { version = "0.8", default-features = false }
-cbc = { version = "0.1", default-features = false, features = ["alloc", "block-padding"] }
+# KLAP's own vocabulary is entirely SHA-1, SHA-256 and AES-128-CBC — the SDK's `crypto` feature
+# above supplies all three, so this crate has no cryptography dependency of its own. What
+# *stays* KLAP's own, in `src/klap.rs`, is the order those primitives are combined in: which
+# bytes get hashed together, in which order, and how the session key is derived from them —
+# that part is TP-Link's protocol, not something the SDK could know on its behalf.
+#
 # The handshake's local seed. A driver that cannot ask for entropy would send the same seed on
 # every connection, which turns a session key into a constant.
 getrandom = "0.2"
