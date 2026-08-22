@@ -9,16 +9,20 @@
 //!                               {"method":"set_device_info","params":{"brightness":40}}
 //! ```
 //!
-//! The crypto is in [`klap`] and the HTTP framing in [`http`], both with their own reasons
-//! written down. What is left here is the state machine, and it exists because of one thing:
+//! The crypto is in [`klap`], with its reasons written down there. What is left here is the
+//! state machine, and it exists because of one thing:
 //!
 //! # Every exchange is several round trips, and a driver cannot wait
 //!
 //! A driver returns [`HostCall`]s and is called again when something arrives; it has no way to
 //! block on a reply. So "turn this light on" is not one call — it is a handshake, a second
 //! handshake, the command, and a read-back, each one landing in [`DriverModule::on_event`]
-//! with the next step to take. That state lives in `inst.scratch`, and `phase` is what says
-//! which reply is expected next.
+//! with the next step to take. That state lives in `inst.scratch`.
+//!
+//! Which reply is which is read off the **URL core echoes back**, not off a phase this driver
+//! remembers. Core returns `url` and `method` beside every response for exactly this, and it
+//! is the more honest of the two: a phase says what this driver last *expected*, and an answer
+//! that arrives after a restart, out of order, or late says what actually happened.
 //!
 //! Two consequences worth stating rather than discovering:
 //!
@@ -35,10 +39,9 @@
 //!
 //! A Tapo has no local subscription and sends nothing unsolicited: turn it up at the wall and
 //! it tells nobody. `Poll interval` is what makes the house eventually agree with the switch,
-//! and it is also what recovers a stalled exchange — a reply that never came leaves `phase`
+//! and it is also what recovers a stalled exchange — a reply that never came leaves the queue
 //! where it was, and the next bind resets it.
 
-mod http;
 mod klap;
 
 use driver_sdk::Value;
@@ -49,10 +52,8 @@ pub struct Tapo;
 
 const LIGHT: LocalId = 1;
 
-/// Where the exchange stands: `""` no session, `hs1`/`hs2` mid-handshake, `ready` usable.
-const PHASE: &str = "phase";
-/// Bytes of a reply that have arrived but do not yet make a whole one.
-const BUFFER: &str = "buffer";
+/// The session is up and requests can go out.
+const READY: &str = "ready";
 const LOCAL_SEED: &str = "local_seed";
 const COOKIE: &str = "cookie";
 const KEY: &str = "key";
@@ -75,6 +76,10 @@ const AFTER_READ: &str = "after_read";
 
 const GET: &str = r#"{"method":"get_device_info","requestTimeMils":0}"#;
 
+const HANDSHAKE1: &str = "/app/handshake1";
+const HANDSHAKE2: &str = "/app/handshake2";
+const REQUEST: &str = "/app/request";
+
 export_driver!(Tapo);
 
 impl DriverModule for Tapo {
@@ -83,7 +88,6 @@ impl DriverModule for Tapo {
     /// Also the reset: half an exchange that never finished is cleared here rather than left
     /// to wedge the queue, which is the only recovery a driver with no clock has.
     fn on_bind(&self, inst: &mut Instance) -> Vec<HostCall> {
-        inst.scratch.remove(BUFFER);
         inst.scratch.remove(INFLIGHT);
         inst.scratch.remove(AFTER_READ);
         // Deliberately dropped rather than carried over. A poll is up to fifteen minutes after
@@ -92,9 +96,6 @@ impl DriverModule for Tapo {
         inst.scratch.remove(QUEUE);
         // The session is kept: it may well still be good, and if the switch has forgotten it
         // the reply says so and the handshake happens then.
-        if matches!(Self::phase(inst).as_str(), "hs1" | "hs2") {
-            inst.scratch.remove(PHASE);
-        }
         Self::request(inst, GET.into())
     }
 
@@ -149,7 +150,7 @@ impl DriverModule for Tapo {
         vec!["ramp_start/ramp_stop — the hardware has no continuous ramp".into()]
     }
 
-    /// Bytes arrived. There may be part of a reply, a whole one, or several.
+    /// A reply came back. Which one it answers is read off the URL core echoed with it.
     fn on_event(
         &self,
         inst: &mut Instance,
@@ -157,34 +158,32 @@ impl DriverModule for Tapo {
         note: &str,
         args: &Args,
     ) -> Vec<HostCall> {
-        if note != "rx" {
+        if note != "http_response" {
             return Vec::new();
         }
-        // `bytes` rather than `data` because this transport declares `binary` — a KLAP reply
-        // read down the text path loses most of itself to a lossy UTF-8 decode.
-        let Some(chunk) = args.get("bytes").and_then(Value::as_array) else {
-            return Vec::new();
-        };
         let Some(host) = Self::host(inst) else {
             return Vec::new();
         };
-
-        let mut buffer = inst
-            .scratch
-            .get(BUFFER)
-            .and_then(Value::as_str)
-            .and_then(unhex)
+        let url = args.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+        let status = args.get("status").and_then(Value::as_u64).unwrap_or(0) as u16;
+        // `bytes` rather than `body` because the request declared itself binary — see
+        // `HttpRequest::bytes`. A KLAP reply read down the text path loses most of itself to a
+        // lossy UTF-8 decode.
+        let body: Vec<u8> = args
+            .get("bytes")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
             .unwrap_or_default();
-        buffer.extend(chunk.iter().filter_map(|v| v.as_u64().map(|n| n as u8)));
 
-        let mut out = Vec::new();
-        while let Some((reply, used)) = http::parse(&buffer) {
-            buffer.drain(..used);
-            out.extend(Self::on_reply(inst, &host, reply));
+        if url.contains(HANDSHAKE1) {
+            Self::on_handshake1(inst, &host, status, &body, args)
+        } else if url.contains(HANDSHAKE2) {
+            Self::on_handshake2(inst, &host, status)
+        } else if url.contains(REQUEST) {
+            Self::on_result(inst, &host, status, &body)
+        } else {
+            Vec::new()
         }
-        // Whatever is half-received waits for the next read.
-        inst.scratch.insert(BUFFER.into(), json!(hex(&buffer)));
-        out
     }
 
     fn discover(&self, _driver_id: &str, state: &Value, input: &Args) -> (SetupStep, Value) {
@@ -216,6 +215,15 @@ impl Tapo {
         json!({ "method": "set_device_info", "params": params, "requestTimeMils": 0 }).to_string()
     }
 
+    /// One POST, with the session cookie if there is one yet.
+    fn post(host: &str, path: &str, cookie: Option<&str>, body: Vec<u8>) -> HostCall {
+        let mut request = HttpRequest::new("POST", format!("http://{host}{path}")).bytes(body);
+        if let Some(id) = cookie {
+            request = request.header("cookie", format!("TP_SESSIONID={id}"));
+        }
+        HostCall::Http(request)
+    }
+
     /// Put one request on the wire, or hold it until there is a session to put it on.
     fn request(inst: &mut Instance, body: String) -> Vec<HostCall> {
         let Some(host) = Self::host(inst) else {
@@ -227,13 +235,13 @@ impl Tapo {
                  checked against the TP-Link account it was set up with",
             )];
         }
-        let phase = Self::phase(inst);
+        let ready = inst.scratch.get(READY).and_then(Value::as_bool) == Some(true);
         let busy = inst.scratch.get(INFLIGHT).and_then(Value::as_bool) == Some(true);
-        if phase != "ready" || busy {
+        if !ready || busy {
             Self::push(inst, body);
             // No session and nothing on its way to getting one: this is the request that
             // starts the handshake. Mid-handshake, the queue is enough.
-            return if phase.is_empty() {
+            return if !ready && !busy {
                 Self::handshake(inst, &host)
             } else {
                 Vec::new()
@@ -256,41 +264,30 @@ impl Tapo {
         inst.scratch.insert(INFLIGHT.into(), json!(true));
         inst.scratch.insert(LAST.into(), json!(body));
         let cookie = inst.scratch.get(COOKIE).and_then(Value::as_str).map(str::to_string);
-        vec![HostCall::Tx {
-            control: 0,
-            data: http::post(
-                &format!("/app/request?seq={seq}"),
-                host,
-                cookie.as_deref(),
-                &framed,
-            ),
-        }]
+        vec![Self::post(
+            host,
+            &format!("{REQUEST}?seq={seq}"),
+            cookie.as_deref(),
+            framed,
+        )]
     }
 
     fn handshake(inst: &mut Instance, host: &str) -> Vec<HostCall> {
         let seed = klap::local_seed();
         inst.scratch.insert(LOCAL_SEED.into(), json!(hex(&seed)));
-        inst.scratch.insert(PHASE.into(), json!("hs1"));
         inst.scratch.insert(INFLIGHT.into(), json!(true));
+        inst.scratch.insert(READY.into(), json!(false));
         inst.scratch.remove(COOKIE);
-        vec![HostCall::Tx {
-            control: 0,
-            data: http::post("/app/handshake1", host, None, &seed),
-        }]
+        vec![Self::post(host, HANDSHAKE1, None, seed.to_vec())]
     }
 
-    /// One whole reply, read according to what was expected.
-    fn on_reply(inst: &mut Instance, host: &str, reply: http::Reply) -> Vec<HostCall> {
-        match Self::phase(inst).as_str() {
-            "hs1" => Self::on_handshake1(inst, host, reply),
-            "hs2" => Self::on_handshake2(inst, host, reply),
-            "ready" => Self::on_result(inst, host, reply),
-            // A reply to a request from before a reset. Nothing to do with it.
-            _ => Vec::new(),
-        }
-    }
-
-    fn on_handshake1(inst: &mut Instance, host: &str, reply: http::Reply) -> Vec<HostCall> {
+    fn on_handshake1(
+        inst: &mut Instance,
+        host: &str,
+        status: u16,
+        body: &[u8],
+        args: &Args,
+    ) -> Vec<HostCall> {
         inst.scratch.insert(INFLIGHT.into(), json!(false));
         let (Some(seed), Some(auth)) = (
             inst.scratch.get(LOCAL_SEED).and_then(Value::as_str).and_then(unhex),
@@ -301,10 +298,13 @@ impl Tapo {
         let Ok(seed) = <[u8; 16]>::try_from(seed) else {
             return Self::give_up(inst, "tapo: the stored local seed is the wrong size");
         };
-        if reply.status != 200 {
-            return Self::give_up(inst, format!("tapo: the dimmer refused the handshake ({})", reply.status));
+        if status != 200 {
+            return Self::give_up(
+                inst,
+                format!("tapo: the dimmer refused the handshake ({status})"),
+            );
         }
-        let Some(remote) = klap::accept_handshake1(&seed, &auth, &reply.body) else {
+        let Some(remote) = klap::accept_handshake1(&seed, &auth, body) else {
             // The device computed its half from the credentials it was set up with and got a
             // different answer. Nothing about retrying helps.
             return Self::give_up(
@@ -313,43 +313,36 @@ impl Tapo {
                  Password, which are the account's, not the Wi-Fi's",
             );
         };
-        if let Some(id) = reply.session {
+        if let Some(id) = session_cookie(args) {
             inst.scratch.insert(COOKIE.into(), json!(id));
         }
         Self::save_session(inst, &klap::Session::derive(&seed, &remote, &auth));
-        inst.scratch.insert(PHASE.into(), json!("hs2"));
         inst.scratch.insert(INFLIGHT.into(), json!(true));
         let cookie = inst.scratch.get(COOKIE).and_then(Value::as_str).map(str::to_string);
-        vec![HostCall::Tx {
-            control: 0,
-            data: http::post(
-                "/app/handshake2",
-                host,
-                cookie.as_deref(),
-                &klap::handshake2(&seed, &remote, &auth),
-            ),
-        }]
+        vec![Self::post(
+            host,
+            HANDSHAKE2,
+            cookie.as_deref(),
+            klap::handshake2(&seed, &remote, &auth).to_vec(),
+        )]
     }
 
-    fn on_handshake2(inst: &mut Instance, host: &str, reply: http::Reply) -> Vec<HostCall> {
+    fn on_handshake2(inst: &mut Instance, host: &str, status: u16) -> Vec<HostCall> {
         inst.scratch.insert(INFLIGHT.into(), json!(false));
-        if reply.status != 200 {
-            return Self::give_up(
-                inst,
-                format!("tapo: the dimmer rejected the login ({})", reply.status),
-            );
+        if status != 200 {
+            return Self::give_up(inst, format!("tapo: the dimmer rejected the login ({status})"));
         }
-        inst.scratch.insert(PHASE.into(), json!("ready"));
+        inst.scratch.insert(READY.into(), json!(true));
         Self::flush(inst, host)
     }
 
-    fn on_result(inst: &mut Instance, host: &str, reply: http::Reply) -> Vec<HostCall> {
+    fn on_result(inst: &mut Instance, host: &str, status: u16, body: &[u8]) -> Vec<HostCall> {
         inst.scratch.insert(INFLIGHT.into(), json!(false));
         let sent = inst.scratch.get(LAST).and_then(Value::as_str).unwrap_or("").to_string();
 
         // 403 is what a Tapo says when it has forgotten the session — a reboot, or a long
         // enough silence. Handshake again and send the same thing, rather than losing it.
-        if reply.status != 200 {
+        if status != 200 {
             Self::clear_session(inst);
             if !sent.is_empty() {
                 Self::push(inst, sent);
@@ -365,7 +358,7 @@ impl Tapo {
         // noise, so this is where a session that has slipped out of step is actually caught,
         // and every reply after it would slip too. Start over rather than retry.
         let message = session
-            .decrypt(session.seq, &reply.body)
+            .decrypt(session.seq, body)
             .and_then(|plain| serde_json::from_slice::<Value>(&plain).ok());
         let Some(message) = message else {
             Self::clear_session(inst);
@@ -452,7 +445,7 @@ impl Tapo {
 
     /// Send the next queued request, if the session is idle.
     fn flush(inst: &mut Instance, host: &str) -> Vec<HostCall> {
-        if Self::phase(inst) != "ready"
+        if inst.scratch.get(READY).and_then(Value::as_bool) != Some(true)
             || inst.scratch.get(INFLIGHT).and_then(Value::as_bool) == Some(true)
         {
             return Vec::new();
@@ -471,10 +464,6 @@ impl Tapo {
     }
 
     // -- scratch -----------------------------------------------------------------------
-
-    fn phase(inst: &Instance) -> String {
-        inst.scratch.get(PHASE).and_then(Value::as_str).unwrap_or("").to_string()
-    }
 
     fn push(inst: &mut Instance, body: String) {
         let mut queue = inst
@@ -520,7 +509,7 @@ impl Tapo {
     }
 
     fn clear_session(inst: &mut Instance) {
-        for key in [PHASE, KEY, IV, SIG, SEQ, COOKIE, LOCAL_SEED, BUFFER, LAST] {
+        for key in [READY, KEY, IV, SIG, SEQ, COOKIE, LOCAL_SEED, LAST] {
             inst.scratch.remove(key);
         }
         inst.scratch.insert(INFLIGHT.into(), json!(false));
@@ -538,11 +527,6 @@ impl Tapo {
     /// that goes wrong here is the TP-Link account, and a dimmer adopted with the wrong
     /// password looks identical to a working one until somebody presses a button.
     fn flow(&self, state: &Value, input: &Args) -> (SetupStep, Value) {
-        // Carried here rather than in each arm that opens a step: an arm may also need to
-        // *listen again* on the same connection, and the id for it arrives in `input` on the
-        // entry before that one. Reading it once at the top is what makes every arm's `state`
-        // enough on its own.
-        let state = &Self::keep_session(state.clone(), input);
         let phase = state.get("phase").and_then(Value::as_str).unwrap_or("start");
         // Empty is absent. A form prefilled with an address nobody had yet writes `""` into the
         // state, and a lookup that took it would shadow what the person then typed.
@@ -552,38 +536,86 @@ impl Tapo {
             };
             text(state.get(key)).or_else(|| text(input.get(key)))
         };
+        let status = || input.get("status").and_then(Value::as_u64).unwrap_or(0) as u16;
+        let received = || {
+            input
+                .get("response_bytes")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as u8))
+                        .collect::<Vec<u8>>()
+                })
+                .unwrap_or_default()
+        };
 
         match phase {
             "start" => {
-                // What the survey already found, if this was reached by pressing Add on a row.
-                let found: Vec<String> = state
-                    .get("ssdp_candidates")
-                    .and_then(Value::as_array)
-                    .map(|rows| {
-                        rows.iter()
-                            .filter_map(|r| r.get("address").and_then(Value::as_str))
-                            .map(str::to_string)
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                // What the broadcast already found, if this was reached by pressing Add on a
+                // row. A Tapo announces nothing over mDNS or SSDP — see the manifest — so this
+                // is the only kind of candidate that ever arrives here.
+                let found = state.get("udp_candidates").and_then(Value::as_array);
                 let chosen = s("chosen_address").or_else(|| {
-                    // One find is not a choice worth putting in front of anybody.
-                    (found.len() == 1).then(|| found[0].clone())
+                    found
+                        .filter(|rows| rows.len() == 1)
+                        .and_then(|rows| rows.first())
+                        .and_then(|row| row.get("address"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
                 });
 
+                // What the device said about itself in that reply. Only ever a nicety for the
+                // address — except `encrypt_type`, which is the one thing a driver otherwise
+                // has to guess at, and guessing wrong looks like a dimmer that refuses a
+                // password somebody typed correctly.
+                let broadcast = chosen
+                    .as_deref()
+                    .and_then(|address| Self::from_broadcast(state, address));
+                if let Some(scheme) = broadcast
+                    .as_ref()
+                    .and_then(|info| info.get("mgt_encrypt_schm"))
+                    .and_then(|s| s.get("encrypt_type"))
+                    .and_then(Value::as_str)
+                    && !scheme.eq_ignore_ascii_case("KLAP")
+                {
+                    return (
+                        SetupStep::Failed {
+                            reason: format!(
+                                "This device says it speaks `{scheme}`, and this driver speaks \
+                                 KLAP. That is the protocol current Tapo firmware uses — a unit \
+                                 old enough to want something else needs a firmware update from \
+                                 the Tapo app, or a driver that has been tested against it."
+                            ),
+                        },
+                        Value::Null,
+                    );
+                }
+
                 match chosen {
-                    Some(address) => Self::ask_credentials(&address),
-                    None if found.len() > 1 => (
+                    Some(address) => Self::ask_credentials(&address, broadcast),
+                    None if found.is_some_and(|rows| rows.len() > 1) => (
                         SetupStep::Pick {
                             title: "Which dimmer?".into(),
-                            body: "These answered a Tapo handshake on this network.".into(),
-                            columns: vec!["Address".into()],
+                            body: "These answered TP-Link's discovery broadcast.".into(),
+                            columns: vec!["Address".into(), "Model".into()],
                             rows: found
-                                .iter()
-                                .map(|a| PickRow {
-                                    value: a.clone(),
-                                    cells: vec![a.clone()],
-                                    note: String::new(),
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|row| {
+                                    let address =
+                                        row.get("address").and_then(Value::as_str)?.to_string();
+                                    let model = Self::from_broadcast(state, &address)
+                                        .and_then(|i| {
+                                            i.get("device_model")
+                                                .and_then(Value::as_str)
+                                                .map(str::to_string)
+                                        })
+                                        .unwrap_or_default();
+                                    Some(PickRow {
+                                        value: address.clone(),
+                                        cells: vec![address, model],
+                                        note: String::new(),
+                                    })
                                 })
                                 .collect(),
                             field: "address".into(),
@@ -597,83 +629,72 @@ impl Tapo {
                                 required: true,
                             }),
                         },
-                        json!({ "phase": "picked" }),
+                        json!({ "phase": "picked", "udp_candidates": state.get("udp_candidates") }),
                     ),
-                    // Nothing found, which is ordinary: a survey only sweeps the controller's
-                    // own /24, and plenty of houses put lighting on another one.
-                    None => Self::ask_credentials(""),
+                    // Nothing found, which is ordinary: a broadcast does not cross a subnet,
+                    // and plenty of houses put lighting on its own.
+                    None => Self::ask_credentials("", None),
                 }
             }
 
-            "picked" => match s("address") {
-                Some(address) => Self::ask_credentials(&address),
-                None => Self::ask_credentials(""),
-            },
+            "picked" => {
+                let address = s("address").unwrap_or_default();
+                let broadcast = Self::from_broadcast(state, &address);
+                Self::ask_credentials(&address, broadcast)
+            }
 
             // Address and account in hand. Prove them.
             "credentials" => {
                 let (Some(address), Some(email), Some(password)) =
                     (s("address"), s("email"), s("password"))
                 else {
-                    return Self::ask_credentials(&s("address").unwrap_or_default());
+                    return Self::ask_credentials(&s("address").unwrap_or_default(), None);
                 };
                 let address = address.trim().to_string();
-                if address.is_empty() {
-                    return Self::ask_credentials("");
-                }
                 let seed = klap::local_seed();
                 (
-                    SetupStep::Session {
-                        session: None,
-                        open: Some(Connect {
-                            host: address.clone(),
-                            port: 80,
-                            tls: false,
-                            client_cert: None,
-                            client_key: None,
-                        }),
-                        accept: None,
-                        send: String::new(),
-                        send_bytes: http::post("/app/handshake1", &address, None, &seed),
-                        read_ms: 3000,
-                        close: false,
+                    SetupStep::Fetch {
+                        request: HttpRequest::new(
+                            "POST",
+                            format!("http://{address}{HANDSHAKE1}"),
+                        )
+                        .bytes(seed.to_vec()),
                         note: "saying hello to the dimmer".into(),
                     },
                     json!({
                         "phase": "hs1", "address": address, "email": email,
-                        "password": password, "local_seed": hex(&seed), "buffer": "",
+                        "password": password, "local_seed": hex(&seed),
+                        "model": s("model"),
                     }),
                 )
             }
 
             "hs1" => {
-                let mut next = state.clone();
-                let Some(reply) = Self::heard(&mut next, input) else {
-                    return Self::listen_again(next, "hs1", "waiting for the dimmer");
-                };
-                let (Some(seed), Some(email), Some(password)) =
-                    (s("local_seed").and_then(|h| unhex(&h)), s("email"), s("password"))
-                else {
-                    return (SetupStep::Failed { reason: "lost the handshake state".into() }, Value::Null);
+                let address = s("address").unwrap_or_default();
+                let (Some(seed), Some(email), Some(password)) = (
+                    s("local_seed").and_then(|h| unhex(&h)),
+                    s("email"),
+                    s("password"),
+                ) else {
+                    return Self::lost();
                 };
                 let Ok(seed) = <[u8; 16]>::try_from(seed) else {
-                    return (SetupStep::Failed { reason: "lost the handshake state".into() }, Value::Null);
+                    return Self::lost();
                 };
-                if reply.status != 200 {
+                if status() != 200 {
                     return (
                         SetupStep::Failed {
                             reason: format!(
-                                "{} answered {} to a Tapo handshake. Check the address — it is \
-                                 under Device Info in the Tapo app.",
-                                s("address").unwrap_or_default(),
-                                reply.status
+                                "{address} answered {} to a Tapo handshake. Check the address — \
+                                 it is under Device Info in the Tapo app.",
+                                status()
                             ),
                         },
                         Value::Null,
                     );
                 }
                 let auth = klap::auth_hash(email.trim(), &password);
-                let Some(remote) = klap::accept_handshake1(&seed, &auth, &reply.body) else {
+                let Some(remote) = klap::accept_handshake1(&seed, &auth, &received()) else {
                     return (
                         SetupStep::Failed {
                             reason: "The dimmer did not accept that TP-Link account. It wants \
@@ -684,26 +705,19 @@ impl Tapo {
                         Value::Null,
                     );
                 };
+                let cookie = setup_cookie(input).unwrap_or_default();
+                let mut request = HttpRequest::new("POST", format!("http://{address}{HANDSHAKE2}"))
+                    .bytes(klap::handshake2(&seed, &remote, &auth).to_vec());
+                if !cookie.is_empty() {
+                    request = request.header("cookie", format!("TP_SESSIONID={cookie}"));
+                }
+                let mut next = state.clone();
                 next["phase"] = json!("hs2");
                 next["remote_seed"] = json!(hex(&remote));
-                next["cookie"] = json!(reply.session.unwrap_or_default());
-                next["tries"] = json!(0);
-                let address = s("address").unwrap_or_default();
-                let cookie = next["cookie"].as_str().unwrap_or("").to_string();
+                next["cookie"] = json!(cookie);
                 (
-                    SetupStep::Session {
-                        session: state.get("session").and_then(Value::as_u64).map(|s| s as u32),
-                        open: None,
-                        accept: None,
-                        send: String::new(),
-                        send_bytes: http::post(
-                            "/app/handshake2",
-                            &address,
-                            (!cookie.is_empty()).then_some(cookie.as_str()),
-                            &klap::handshake2(&seed, &remote, &auth),
-                        ),
-                        read_ms: 3000,
-                        close: false,
+                    SetupStep::Fetch {
+                        request,
                         note: "signing in".into(),
                     },
                     next,
@@ -711,14 +725,10 @@ impl Tapo {
             }
 
             "hs2" => {
-                let mut next = state.clone();
-                let Some(reply) = Self::heard(&mut next, input) else {
-                    return Self::listen_again(next, "hs2", "signing in");
-                };
-                if reply.status != 200 {
+                if status() != 200 {
                     return (
                         SetupStep::Failed {
-                            reason: format!("The dimmer rejected the login ({}).", reply.status),
+                            reason: format!("The dimmer rejected the login ({}).", status()),
                         },
                         Value::Null,
                     );
@@ -729,38 +739,36 @@ impl Tapo {
                     s("email"),
                     s("password"),
                 ) else {
-                    return (SetupStep::Failed { reason: "lost the handshake state".into() }, Value::Null);
+                    return Self::lost();
                 };
                 let (Ok(local), Ok(remote)) =
                     (<[u8; 16]>::try_from(local), <[u8; 16]>::try_from(remote))
                 else {
-                    return (SetupStep::Failed { reason: "lost the handshake state".into() }, Value::Null);
+                    return Self::lost();
                 };
                 let auth = klap::auth_hash(email.trim(), &password);
                 let mut session = klap::Session::derive(&local, &remote, &auth);
                 let (seq, framed) = session.encrypt(GET.as_bytes());
                 let (key, iv, sig) = session.parts();
+                let address = s("address").unwrap_or_default();
+                let cookie = s("cookie").unwrap_or_default();
+                let mut request = HttpRequest::new(
+                    "POST",
+                    format!("http://{address}{REQUEST}?seq={seq}"),
+                )
+                .bytes(framed);
+                if !cookie.is_empty() {
+                    request = request.header("cookie", format!("TP_SESSIONID={cookie}"));
+                }
+                let mut next = state.clone();
                 next["phase"] = json!("info");
                 next["key"] = json!(hex(&key));
                 next["iv"] = json!(hex(&iv));
                 next["sig"] = json!(hex(&sig));
                 next["seq"] = json!(seq);
-                next["tries"] = json!(0);
-                let cookie = s("cookie").unwrap_or_default();
                 (
-                    SetupStep::Session {
-                        session: state.get("session").and_then(Value::as_u64).map(|s| s as u32),
-                        open: None,
-                        accept: None,
-                        send: String::new(),
-                        send_bytes: http::post(
-                            &format!("/app/request?seq={seq}"),
-                            &s("address").unwrap_or_default(),
-                            (!cookie.is_empty()).then_some(cookie.as_str()),
-                            &framed,
-                        ),
-                        read_ms: 3000,
-                        close: true,
+                    SetupStep::Fetch {
+                        request,
                         note: "asking the dimmer what it is".into(),
                     },
                     next,
@@ -768,10 +776,6 @@ impl Tapo {
             }
 
             "info" => {
-                let mut next = state.clone();
-                let Some(reply) = Self::heard(&mut next, input) else {
-                    return Self::listen_again(next, "info", "asking the dimmer what it is");
-                };
                 let address = s("address").unwrap_or_default();
                 let (Some(key), Some(iv), Some(sig), Some(seq)) = (
                     s("key").and_then(|h| unhex(&h)),
@@ -779,18 +783,18 @@ impl Tapo {
                     s("sig").and_then(|h| unhex(&h)),
                     state.get("seq").and_then(Value::as_i64),
                 ) else {
-                    return (SetupStep::Failed { reason: "lost the session state".into() }, Value::Null);
+                    return Self::lost();
                 };
                 let (Ok(key), Ok(iv), Ok(sig)) = (
                     <[u8; 16]>::try_from(key),
                     <[u8; 12]>::try_from(iv),
                     <[u8; 28]>::try_from(sig),
                 ) else {
-                    return (SetupStep::Failed { reason: "lost the session state".into() }, Value::Null);
+                    return Self::lost();
                 };
                 let session = klap::Session::restore(key, iv, sig, seq as i32);
                 let info = session
-                    .decrypt(seq as i32, &reply.body)
+                    .decrypt(seq as i32, &received())
                     .and_then(|plain| serde_json::from_slice::<Value>(&plain).ok())
                     .unwrap_or(Value::Null);
                 let result = info.get("result").cloned().unwrap_or(Value::Null);
@@ -802,11 +806,14 @@ impl Tapo {
                     .and_then(Value::as_str)
                     .and_then(from_base64)
                     .filter(|n| !n.trim().is_empty());
+                // The broadcast named the model too, and agrees; this is the authenticated
+                // answer, so it wins where both exist.
                 let model = result
                     .get("model")
                     .and_then(Value::as_str)
-                    .unwrap_or("Tapo dimmer")
-                    .to_string();
+                    .map(str::to_string)
+                    .or_else(|| s("model"))
+                    .unwrap_or_else(|| "Tapo dimmer".into());
 
                 let mut properties = std::collections::BTreeMap::new();
                 properties.insert("Address".into(), json!(address));
@@ -815,7 +822,7 @@ impl Tapo {
 
                 (
                     SetupStep::done(vec![Candidate {
-                        label: nickname.clone().unwrap_or_else(|| format!("{model} at {address}")),
+                        label: nickname.unwrap_or_else(|| format!("{model} at {address}")),
                         driver_id: "tapo.dimmer".into(),
                         properties,
                         verified: match result.get("device_on").and_then(Value::as_bool) {
@@ -832,20 +839,62 @@ impl Tapo {
             }
 
             other => (
-                SetupStep::Failed { reason: format!("unknown setup phase `{other}`") },
+                SetupStep::Failed {
+                    reason: format!("unknown setup phase `{other}`"),
+                },
                 Value::Null,
             ),
         }
     }
 
-    fn ask_credentials(address: &str) -> (SetupStep, Value) {
+    /// What the device said when it answered the discovery broadcast, for one address.
+    ///
+    /// TP-Link's reply is a sixteen-byte header and then JSON, so the JSON is found rather
+    /// than assumed to start at zero — the header's length and contents are the vendor's and
+    /// have changed before.
+    fn from_broadcast(state: &Value, address: &str) -> Option<Value> {
+        let row = state
+            .get("udp_candidates")?
+            .as_array()?
+            .iter()
+            .find(|row| row.get("address").and_then(Value::as_str) == Some(address))?;
+        let bytes: Vec<u8> = row
+            .get("reply")?
+            .as_array()?
+            .iter()
+            .filter_map(|v| v.as_u64().map(|n| n as u8))
+            .collect();
+        let text = String::from_utf8_lossy(&bytes);
+        let json = &text[text.find('{')?..];
+        let parsed: Value = serde_json::from_str(json).ok()?;
+        // Everything useful is under `result`; a reply that is shaped differently is one this
+        // driver should not be reading fields out of.
+        parsed.get("result").cloned()
+    }
+
+    fn ask_credentials(address: &str, broadcast: Option<Value>) -> (SetupStep, Value) {
+        let model = broadcast
+            .as_ref()
+            .and_then(|i| i.get("device_model"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let body = if model.is_empty() {
+            "Tapo checks local control against the TP-Link account the switch is paired to. \
+             This is that account — the one you sign in to the Tapo app with — and it is \
+             checked here rather than taken on trust."
+                .to_string()
+        } else {
+            format!(
+                "This is a {model}. Tapo checks local control against the TP-Link account the \
+                 switch is paired to — the one you sign in to the Tapo app with — and it is \
+                 checked here rather than taken on trust."
+            )
+        };
         (
             SetupStep::Form {
                 title: "Sign in to the dimmer".into(),
-                body: "Tapo checks local control against the TP-Link account the switch is \
-                       paired to. This is that account — the one you sign in to the Tapo app \
-                       with — and it is checked here rather than taken on trust."
-                    .into(),
+                body,
                 fields: vec![
                     Field {
                         name: "address".into(),
@@ -876,82 +925,47 @@ impl Tapo {
                     },
                 ],
             },
-            json!({ "phase": "credentials", "address": address }),
+            json!({ "phase": "credentials", "address": address, "model": model }),
         )
     }
 
-    /// The reply built out of however many reads it took.
-    ///
-    /// Core returns whatever arrived in the window, which for a 48-byte handshake is normally
-    /// all of it and occasionally is not. The tail is kept in the flow state, exactly as the
-    /// runtime path keeps it in scratch.
-    fn heard(state: &mut Value, input: &Args) -> Option<http::Reply> {
-        let mut buffer = state
-            .get("buffer")
-            .and_then(Value::as_str)
-            .and_then(unhex)
-            .unwrap_or_default();
-        buffer.extend(
-            input
-                .get("received_bytes")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect::<Vec<u8>>())
-                .unwrap_or_default(),
-        );
-        match http::parse(&buffer) {
-            Some((reply, used)) => {
-                state["buffer"] = json!(hex(&buffer[used..]));
-                Some(reply)
-            }
-            None => {
-                state["buffer"] = json!(hex(&buffer));
-                None
-            }
-        }
-    }
-
-    /// Listen again on the same connection, sending nothing.
-    fn listen_again(mut state: Value, phase: &str, note: &str) -> (SetupStep, Value) {
-        let tries = state.get("tries").and_then(Value::as_u64).unwrap_or(0);
-        if tries >= 4 {
-            return (
-                SetupStep::Failed {
-                    reason: "The dimmer stopped part-way through answering. Try again — if it \
-                             keeps happening, something else on the network is holding its one \
-                             connection."
-                        .into(),
-                },
-                Value::Null,
-            );
-        }
-        state["tries"] = json!(tries + 1);
-        state["phase"] = json!(phase);
-        let session = state.get("session").and_then(Value::as_u64).map(|s| s as u32);
+    /// The flow state did not survive, which is a bug here rather than anything about the
+    /// hardware — so it says so rather than blaming the dimmer.
+    fn lost() -> (SetupStep, Value) {
         (
-            SetupStep::Session {
-                session,
-                open: None,
-                accept: None,
-                send: String::new(),
-                send_bytes: Vec::new(),
-                read_ms: 2000,
-                close: false,
-                note: note.into(),
+            SetupStep::Failed {
+                reason: "Lost track of the handshake part-way through. Start setup again.".into(),
             },
-            state,
+            Value::Null,
         )
-    }
-
-    /// Carry the open connection's id into the next step.
-    fn keep_session(mut state: Value, input: &Args) -> Value {
-        if let Some(id) = input.get("session") {
-            state["session"] = id.clone();
-        }
-        state
     }
 }
 
 // ---------------------------------------------------------------------------------------
+
+/// `TP_SESSIONID` out of a response's headers, which is where a Tapo issues it.
+fn session_cookie(args: &Args) -> Option<String> {
+    cookie_in(args.get("headers"))
+}
+
+/// The same, from a `SetupStep::Fetch` reply.
+fn setup_cookie(input: &Args) -> Option<String> {
+    cookie_in(input.get("response_headers"))
+}
+
+fn cookie_in(headers: Option<&Value>) -> Option<String> {
+    headers?.as_array()?.iter().find_map(|entry| {
+        let pair = entry.as_array()?;
+        let name = pair.first()?.as_str()?;
+        let value = pair.get(1)?.as_str()?;
+        if !name.eq_ignore_ascii_case("set-cookie") {
+            return None;
+        }
+        // `TP_SESSIONID=ABC;TIMEOUT=1440` — the id is up to the first attribute.
+        let rest = value.trim().strip_prefix("TP_SESSIONID=")?;
+        Some(rest.split(';').next().unwrap_or(rest).to_string())
+    })
+}
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -1005,42 +1019,47 @@ mod tests {
         inst
     }
 
-    /// The body of the one request the driver just made, and the path it went to.
+    /// The one request the driver just made: where it went and what it carried.
     fn sent(calls: &[HostCall]) -> (String, Vec<u8>) {
-        let data = calls
+        calls
             .iter()
             .find_map(|c| match c {
-                HostCall::Tx { data, .. } => Some(data.clone()),
+                HostCall::Http(r) => Some((r.url.clone(), r.body_bytes.clone())),
                 _ => None,
             })
-            .expect("a request");
-        let end = data.windows(4).position(|w| w == b"\r\n\r\n").expect("headers") + 4;
-        let head = String::from_utf8_lossy(&data[..end]).to_string();
-        let path = head.split_whitespace().nth(1).expect("a path").to_string();
-        (path, data[end..].to_vec())
+            .expect("a request")
     }
 
-    /// What core delivers when bytes come back.
-    fn rx(bytes: &[u8]) -> Args {
+    /// What core delivers when a reply comes back.
+    fn answered(url: &str, status: u16, body: &[u8], cookie: bool) -> Args {
         let mut args = Args::new();
-        args.insert("bytes".into(), json!(bytes));
+        args.insert("url".into(), json!(url));
+        args.insert("method".into(), json!("POST"));
+        args.insert("status".into(), json!(status));
+        args.insert("bytes".into(), json!(body));
+        let headers = if cookie {
+            json!([["set-cookie", "TP_SESSIONID=SID;TIMEOUT=1440"], ["content-length", "48"]])
+        } else {
+            json!([["content-length", "16"]])
+        };
+        args.insert("headers".into(), headers);
         args
     }
 
-    fn reply(body: &[u8], cookie: bool) -> Vec<u8> {
-        let mut out = format!(
-            "HTTP/1.1 200 OK\r\n{}Content-Length: {}\r\n\r\n",
-            if cookie { "Set-Cookie: TP_SESSIONID=SID;TIMEOUT=1440\r\n" } else { "" },
-            body.len()
-        )
-        .into_bytes();
-        out.extend_from_slice(body);
+    /// The switch's half of handshake1, computed the way the device computes it.
+    fn hs1_reply(local: &[u8; 16], remote: &[u8; 16], auth: &[u8; 32]) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(local);
+        h.update(remote);
+        h.update(auth);
+        let mut out = remote.to_vec();
+        out.extend_from_slice(&h.finalize());
         out
     }
 
-    /// The switch's answer to the request at `seq` — encrypted the same way, at the same
-    /// sequence, which is what the device does. `encrypt` always advances, so it is wound back
-    /// one first rather than given a second entry point that only a test would use.
+    /// The switch's answer to the request at `seq`. `encrypt` always advances, so the
+    /// stand-in is wound back one rather than given a second entry point only a test would use.
     fn answer(device: &mut klap::Session, seq: i32, plain: &[u8]) -> Vec<u8> {
         device.seq = seq - 1;
         let (used, body) = device.encrypt(plain);
@@ -1058,10 +1077,9 @@ mod tests {
     /// The whole exchange, with the test playing the switch: handshake, the read the bind
     /// asked for, a command, and the read-back that command triggers.
     ///
-    /// It is one test rather than four because the states only mean anything in sequence —
-    /// the sequence number, the queue and the phase are all carried between them, and every
-    /// bug this has found so far was a step being right on its own and wrong after the last
-    /// one.
+    /// One test rather than four because the states only mean anything in sequence — the
+    /// sequence number, the queue and the session are carried between them, and every bug this
+    /// has found was a step being right on its own and wrong after the last one.
     #[test]
     fn a_bind_a_command_and_a_read_back() {
         let tapo = Tapo;
@@ -1070,32 +1088,27 @@ mod tests {
 
         // -- bind: nothing is known, so this has to start with a handshake ------------------
         let calls = tapo.on_bind(&mut inst);
-        let (path, body) = sent(&calls);
-        assert_eq!(path, "/app/handshake1");
+        let (url, body) = sent(&calls);
+        assert_eq!(url, "http://10.0.0.4/app/handshake1");
         let local: [u8; 16] = body.try_into().expect("a 16-byte seed");
 
-        // The switch answers with its own seed and proof it holds the account.
         let remote = [3u8; 16];
-        let mut hs1 = remote.to_vec();
-        hs1.extend_from_slice(&{
-            use sha2::{Digest, Sha256};
-            let mut h = Sha256::new();
-            h.update(local);
-            h.update(remote);
-            h.update(auth);
-            h.finalize()
-        });
-        let calls = tapo.on_event(&mut inst, 0, "rx", &rx(&reply(&hs1, true)));
-        let (path, body) = sent(&calls);
-        assert_eq!(path, "/app/handshake2");
+        let calls = tapo.on_event(
+            &mut inst,
+            0,
+            "http_response",
+            &answered(&url, 200, &hs1_reply(&local, &remote, &auth), true),
+        );
+        let (url, body) = sent(&calls);
+        assert_eq!(url, "http://10.0.0.4/app/handshake2");
         assert_eq!(body, klap::handshake2(&local, &remote, &auth));
 
         // -- the session is up, so the bind's own question goes out ------------------------
         let mut device = klap::Session::derive(&local, &remote, &auth);
         let mut seq = device.seq + 1;
-        let calls = tapo.on_event(&mut inst, 0, "rx", &rx(&reply(b"", false)));
-        let (path, body) = sent(&calls);
-        assert_eq!(path, format!("/app/request?seq={seq}"));
+        let calls = tapo.on_event(&mut inst, 0, "http_response", &answered(&url, 200, b"", false));
+        let (url, body) = sent(&calls);
+        assert_eq!(url, format!("http://10.0.0.4/app/request?seq={seq}"));
         assert_eq!(
             device.decrypt(seq, &body).as_deref(),
             Some(GET.as_bytes()),
@@ -1103,9 +1116,12 @@ mod tests {
         );
 
         // 40% and on. Both are reported, because a Tapo keeps power and brightness apart.
-        let info = br#"{"error_code":0,"result":{"device_on":true,"brightness":40}}"#;
-        let framed = answer(&mut device, seq, info);
-        let calls = tapo.on_event(&mut inst, 0, "rx", &rx(&reply(&framed, false)));
+        let framed = answer(
+            &mut device,
+            seq,
+            br#"{"error_code":0,"result":{"device_on":true,"brightness":40}}"#,
+        );
+        let calls = tapo.on_event(&mut inst, 0, "http_response", &answered(&url, 200, &framed, false));
         assert_eq!(notified(&calls, "power_changed").unwrap().get("on"), Some(&json!(true)));
         assert_eq!(notified(&calls, "level_changed").unwrap().get("level"), Some(&json!(40)));
 
@@ -1113,7 +1129,7 @@ mod tests {
         let mut args = Args::new();
         args.insert("level".into(), json!(0));
         let calls = tapo.on_command(&mut inst, LIGHT, "set_level", &args);
-        let (_, body) = sent(&calls);
+        let (url, body) = sent(&calls);
         seq += 1;
         let plain = device.decrypt(seq, &body).expect("the command");
         // Zero is off, not brightness zero — the switch refuses that and would report success.
@@ -1123,11 +1139,11 @@ mod tests {
         // A write is acknowledged with nothing to read, so the driver asks again rather than
         // reporting what it hoped for.
         let framed = answer(&mut device, seq, br#"{"error_code":0}"#);
-        let calls = tapo.on_event(&mut inst, 0, "rx", &rx(&reply(&framed, false)));
+        let calls = tapo.on_event(&mut inst, 0, "http_response", &answered(&url, 200, &framed, false));
         assert!(notified(&calls, "power_changed").is_none(), "nothing was read back yet");
-        let (path, body) = sent(&calls);
+        let (url, body) = sent(&calls);
         seq += 1;
-        assert_eq!(path, format!("/app/request?seq={seq}"));
+        assert_eq!(url, format!("http://10.0.0.4/app/request?seq={seq}"));
         assert_eq!(device.decrypt(seq, &body).as_deref(), Some(GET.as_bytes()));
 
         let framed = answer(
@@ -1135,74 +1151,173 @@ mod tests {
             seq,
             br#"{"error_code":0,"result":{"device_on":false,"brightness":40}}"#,
         );
-        let calls = tapo.on_event(&mut inst, 0, "rx", &rx(&reply(&framed, false)));
+        let calls = tapo.on_event(&mut inst, 0, "http_response", &answered(&url, 200, &framed, false));
         assert_eq!(notified(&calls, "power_changed").unwrap().get("on"), Some(&json!(false)));
         // The brightness did not move, so nothing claims it did.
         assert!(notified(&calls, "level_changed").is_none());
     }
 
-    /// Setup end to end, with the test playing the switch again: credentials in, a name out.
-    ///
-    /// Worth its own test because setup speaks the same protocol over a different mechanism —
-    /// `SetupStep::Session` rather than `HostCall::Tx` — and the state it carries between steps
-    /// is a flow value rather than scratch. Nothing is shared but `klap` and `http`, so the two
-    /// halves can be wrong independently.
+    /// A session the switch has forgotten is rebuilt, and the command that found out is not
+    /// lost on the way. A dropped `off` is a light left on.
+    #[test]
+    fn a_forgotten_session_is_rebuilt_and_the_command_retried() {
+        let tapo = Tapo;
+        let mut inst = dimmer();
+        let auth = klap::auth_hash(EMAIL, PASSWORD);
+
+        let calls = tapo.on_bind(&mut inst);
+        let (url, body) = sent(&calls);
+        let local: [u8; 16] = body.try_into().unwrap();
+        let remote = [4u8; 16];
+        let calls = tapo.on_event(
+            &mut inst,
+            0,
+            "http_response",
+            &answered(&url, 200, &hs1_reply(&local, &remote, &auth), true),
+        );
+        let (url, _) = sent(&calls);
+        let calls = tapo.on_event(&mut inst, 0, "http_response", &answered(&url, 200, b"", false));
+        let (url, _) = sent(&calls);
+
+        // The switch rebooted between the handshake and now.
+        let calls = tapo.on_event(&mut inst, 0, "http_response", &answered(&url, 403, b"", false));
+        let (url, _) = sent(&calls);
+        assert_eq!(url, "http://10.0.0.4/app/handshake1", "a 403 means handshake again");
+
+        // And after the new handshake the question that was refused goes out again.
+        let (_, body) = sent(&calls);
+        let local: [u8; 16] = body.try_into().unwrap();
+        let remote = [5u8; 16];
+        let calls = tapo.on_event(
+            &mut inst,
+            0,
+            "http_response",
+            &answered(&url, 200, &hs1_reply(&local, &remote, &auth), true),
+        );
+        let (url, _) = sent(&calls);
+        let calls = tapo.on_event(&mut inst, 0, "http_response", &answered(&url, 200, b"", false));
+        let (url, body) = sent(&calls);
+        let device = klap::Session::derive(&local, &remote, &auth);
+        assert!(url.contains("/app/request?seq="));
+        assert_eq!(
+            device.decrypt(device.seq + 1, &body).as_deref(),
+            Some(GET.as_bytes()),
+            "the request the 403 refused has to be retried, not dropped"
+        );
+    }
+
+    /// The password is the thing that goes wrong here, and it has to be said so.
+    #[test]
+    fn a_wrong_account_is_named_rather_than_retried() {
+        let tapo = Tapo;
+        let mut inst = dimmer();
+        let calls = tapo.on_bind(&mut inst);
+        let (url, body) = sent(&calls);
+        let local: [u8; 16] = body.try_into().unwrap();
+
+        // The switch computed its half from a different password.
+        let other = klap::auth_hash(EMAIL, "not this one");
+        let calls = tapo.on_event(
+            &mut inst,
+            0,
+            "http_response",
+            &answered(&url, 200, &hs1_reply(&local, &[1u8; 16], &other), true),
+        );
+        let warned = calls.iter().any(|c| {
+            matches!(c, HostCall::Log { level, msg } if level == "warn" && msg.contains("TP-Link account"))
+        });
+        assert!(warned, "got {calls:?}");
+        // And it stops: no second handshake, and the queue is not left holding the question.
+        assert!(!calls.iter().any(|c| matches!(c, HostCall::Http(_))));
+    }
+
+    /// Setup end to end, with the test playing the switch again: a broadcast reply and
+    /// credentials in, a named device out.
     #[test]
     fn setup_signs_in_and_names_the_dimmer() {
         let tapo = Tapo;
         let auth = klap::auth_hash(EMAIL, PASSWORD);
 
-        // The form comes back with what somebody typed.
+        // What core hands the flow after a discovery broadcast: sixteen bytes of vendor header
+        // and then JSON, exactly as it arrived.
+        let mut reply = vec![0x02, 0x00, 0x00, 0x01, 0x02, 0, 0, 0, 0, 0, 0, 0, 0x46, 0x3c, 0xb5, 0xd3];
+        reply.extend_from_slice(
+            br#"{"result":{"device_model":"S500D","mgt_encrypt_schm":{"encrypt_type":"KLAP"}}}"#,
+        );
+        let seed_state = json!({
+            "chosen_address": "10.0.0.4",
+            "udp_candidates": [{ "address": "10.0.0.4", "port": 20002, "reply": reply }],
+        });
+
+        // The broadcast names the model, so the form says which device it is asking about.
+        let (step, state) = tapo.discover("tapo.dimmer", &seed_state, &Args::new());
+        let SetupStep::Form { body, .. } = &step else {
+            panic!("expected a form, got {step:?}");
+        };
+        assert!(body.contains("S500D"), "the broadcast's model should reach the screen: {body}");
+
         let mut input = Args::new();
         input.insert("address".into(), json!("10.0.0.4"));
         input.insert("email".into(), json!(EMAIL));
         input.insert("password".into(), json!(PASSWORD));
-        let (step, state) = tapo.setup("tapo.dimmer", &json!({ "phase": "credentials" }), &input);
-        let SetupStep::Session { send_bytes, open, .. } = step else {
-            panic!("expected a connection, got {step:?}");
+        let (step, state) = tapo.setup("tapo.dimmer", &state, &input);
+        let SetupStep::Fetch { request, .. } = step else {
+            panic!("expected a handshake, got {step:?}");
         };
-        assert_eq!(open.expect("an address").host, "10.0.0.4");
-        let local: [u8; 16] = send_bytes[send_bytes.len() - 16..].try_into().unwrap();
+        assert_eq!(request.url, "http://10.0.0.4/app/handshake1");
+        assert!(request.binary, "the handshake is not text");
+        let local: [u8; 16] = request.body_bytes.try_into().unwrap();
 
-        // Core answers with the id of the connection it opened, and the switch's reply.
         let remote = [11u8; 16];
-        let mut hs1 = remote.to_vec();
-        hs1.extend_from_slice(&{
-            use sha2::{Digest, Sha256};
-            let mut h = Sha256::new();
-            h.update(local);
-            h.update(remote);
-            h.update(auth);
-            h.finalize()
-        });
-        let heard = |bytes: &[u8], session: u32| {
+        let fetched = |bytes: &[u8], cookie: bool| {
             let mut a = Args::new();
-            a.insert("received_bytes".into(), json!(bytes));
-            a.insert("session".into(), json!(session));
+            a.insert("status".into(), json!(200));
+            a.insert("response_bytes".into(), json!(bytes));
+            a.insert(
+                "response_headers".into(),
+                if cookie {
+                    json!([["set-cookie", "TP_SESSIONID=SID;TIMEOUT=1440"]])
+                } else {
+                    json!([])
+                },
+            );
             a
         };
-        let (step, state) = tapo.setup("tapo.dimmer", &state, &heard(&reply(&hs1, true), 7));
-        let SetupStep::Session { send_bytes, session, .. } = step else {
+
+        let (step, state) = tapo.setup(
+            "tapo.dimmer",
+            &state,
+            &fetched(&hs1_reply(&local, &remote, &auth), true),
+        );
+        let SetupStep::Fetch { request, .. } = step else {
             panic!("expected handshake2, got {step:?}");
         };
-        // The connection core opened is the one being continued, not a second one.
-        assert_eq!(session, Some(7));
-        assert_eq!(send_bytes[send_bytes.len() - 32..], klap::handshake2(&local, &remote, &auth));
+        assert_eq!(request.body_bytes, klap::handshake2(&local, &remote, &auth));
+        // The session id is issued in a header and presented on every request after it.
+        assert!(
+            request
+                .headers
+                .iter()
+                .any(|(k, v)| k == "cookie" && v == "TP_SESSIONID=SID"),
+            "the cookie has to be carried forward: {:?}",
+            request.headers
+        );
 
-        // Signed in. Now it asks what it is talking to.
-        let (step, state) = tapo.setup("tapo.dimmer", &state, &heard(&reply(b"", false), 7));
-        let SetupStep::Session { send_bytes, .. } = step else {
+        let (step, state) = tapo.setup("tapo.dimmer", &state, &fetched(b"", false));
+        let SetupStep::Fetch { request, .. } = step else {
             panic!("expected get_device_info, got {step:?}");
         };
         let mut device = klap::Session::derive(&local, &remote, &auth);
         let seq = device.seq + 1;
-        let end = send_bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
-        assert_eq!(device.decrypt(seq, &send_bytes[end..]).as_deref(), Some(GET.as_bytes()));
+        assert_eq!(
+            device.decrypt(seq, &request.body_bytes).as_deref(),
+            Some(GET.as_bytes())
+        );
 
         // "Hall" in base64, which is how a Tapo sends every name a person set.
         let info = br#"{"error_code":0,"result":{"device_on":true,"brightness":60,"nickname":"SGFsbA==","model":"S500D"}}"#;
         let framed = answer(&mut device, seq, info);
-        let (step, _) = tapo.setup("tapo.dimmer", &state, &heard(&reply(&framed, false), 7));
+        let (step, _) = tapo.setup("tapo.dimmer", &state, &fetched(&framed, false));
         let SetupStep::Done { devices, .. } = step else {
             panic!("expected a device, got {step:?}");
         };
@@ -1213,59 +1328,25 @@ mod tests {
         assert_eq!(devices[0].properties["Password"], json!(PASSWORD));
     }
 
-    /// A reply that arrives in pieces, which is what a 250 ms read window does to one.
+    /// A unit that says it speaks something else is refused with the reason, rather than
+    /// adopted and then failing to log in forever.
     #[test]
-    fn a_reply_split_across_reads_is_not_acted_on_early() {
-        let tapo = Tapo;
-        let mut inst = dimmer();
-        let calls = tapo.on_bind(&mut inst);
-        let (_, body) = sent(&calls);
-        let local: [u8; 16] = body.try_into().unwrap();
-        let auth = klap::auth_hash(EMAIL, PASSWORD);
-        let remote = [5u8; 16];
-        let mut hs1 = remote.to_vec();
-        hs1.extend_from_slice(&{
-            use sha2::{Digest, Sha256};
-            let mut h = Sha256::new();
-            h.update(local);
-            h.update(remote);
-            h.update(auth);
-            h.finalize()
-        });
-        let whole = reply(&hs1, true);
-
-        // Half a reply is not a reply. Nothing goes out, and nothing is lost.
-        let calls = tapo.on_event(&mut inst, 0, "rx", &rx(&whole[..30]));
-        assert!(calls.is_empty());
-        let calls = tapo.on_event(&mut inst, 0, "rx", &rx(&whole[30..]));
-        assert_eq!(sent(&calls).0, "/app/handshake2");
-    }
-
-    /// The password is the thing that goes wrong here, and it has to be said so.
-    #[test]
-    fn a_wrong_account_is_named_rather_than_retried() {
-        let tapo = Tapo;
-        let mut inst = dimmer();
-        let calls = tapo.on_bind(&mut inst);
-        let (_, body) = sent(&calls);
-        let local: [u8; 16] = body.try_into().unwrap();
-
-        // The switch computed its half from a different password.
-        let other = klap::auth_hash(EMAIL, "not this one");
-        let remote = [1u8; 16];
-        let mut hs1 = remote.to_vec();
-        hs1.extend_from_slice(&{
-            use sha2::{Digest, Sha256};
-            let mut h = Sha256::new();
-            h.update(local);
-            h.update(remote);
-            h.update(other);
-            h.finalize()
-        });
-        let calls = tapo.on_event(&mut inst, 0, "rx", &rx(&reply(&hs1, true)));
-        let warned = calls.iter().any(|c| matches!(c, HostCall::Log { level, msg } if level == "warn" && msg.contains("TP-Link account")));
-        assert!(warned, "got {calls:?}");
-        // And it stops: no second handshake, and the queue is not left holding the question.
-        assert!(!calls.iter().any(|c| matches!(c, HostCall::Tx { .. })));
+    fn a_device_on_the_old_protocol_is_told_why_not() {
+        let mut reply = vec![0u8; 16];
+        reply.extend_from_slice(
+            br#"{"result":{"device_model":"HS100","mgt_encrypt_schm":{"encrypt_type":"AES"}}}"#,
+        );
+        let (step, _) = Tapo.discover(
+            "tapo.dimmer",
+            &json!({
+                "chosen_address": "10.0.0.9",
+                "udp_candidates": [{ "address": "10.0.0.9", "port": 20002, "reply": reply }],
+            }),
+            &Args::new(),
+        );
+        let SetupStep::Failed { reason } = step else {
+            panic!("expected a refusal, got {step:?}");
+        };
+        assert!(reason.contains("AES") && reason.contains("KLAP"), "{reason}");
     }
 }

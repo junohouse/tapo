@@ -10,11 +10,16 @@ doing nothing. No button events either — the paddle works, and nothing local r
 
 ## Setup
 
-Discovery is a probe, not an announcement: a Tapo advertises nothing over mDNS or SSDP, so a
-controller with this driver installed sweeps its own network for port 80 and knocks with a KLAP
-handshake1. That knock needs no credentials and grants nothing, and a Tapo answers it by opening
-a session — which is what puts `TP_SESSIONID` in the reply headers and identifies one. Nothing
-else on port 80 in a house sends that cookie name.
+Discovery is a broadcast, not an announcement: a Tapo advertises nothing over mDNS, SSDP or
+SDDP, and answers exactly one thing — TP-Link's own discovery query, on UDP 20002, in TP-Link's
+own format. That query and the reply that identifies one are declared in the manifest as
+`[[discovery.udp]]`, and core does the sending and the listening. It runs against the whole
+registry index, so a controller with this driver *not* installed still lists the dimmer.
+
+The reply is worth more than an address. It names the model — which is why the sign-in screen
+knows what it is asking about — and it names the encryption scheme the device wants, so a unit
+that is not on KLAP is refused with a sentence saying so rather than adopted and left failing to
+log in forever.
 
 Setup then asks for the **TP-Link account** the dimmer is paired to: the email and password you
 sign in to the Tapo app with. That is not a per-device secret and there is no pairing flow to
@@ -32,14 +37,12 @@ A Tapo has no local subscription and pushes nothing: turn it up at the wall and 
 `Poll interval` (30 s by default) is what makes the house eventually agree with the switch, and
 it is also what recovers a stalled exchange.
 
-## Why the HTTP is written by hand
+## Session keys live in scratch
 
-KLAP is HTTP on port 80, and `HostCall::Http` cannot carry it: its body is a `String` in both
-directions, so raw seeds and AES ciphertext arrive with every non-UTF-8 byte replaced, and the
-reply's `Set-Cookie` — where the session id lives — never reaches a driver at all. So this goes
-out over the device's own `binary` transport as `HostCall::Tx`, and `src/http.rs` owns the
-framing a client would normally own. `src/klap.rs` is the crypto; both have their reasons in
-their module docs.
+The handshake derives a key, an IV and a signing key, and they go in `inst.scratch` — which
+core persists, so a restart resumes the session rather than re-handshaking. If the switch has
+forgotten it in the meantime it answers 403, and this driver handshakes again and re-sends the
+request that found out, rather than dropping it. A lost `off` is a light left on.
 
 ## Not implemented
 
@@ -51,8 +54,10 @@ their module docs.
 
 Untested against real hardware. The protocol here follows
 [python-kasa](https://github.com/python-kasa/python-kasa)'s KLAP implementation, which is the
-field-tested reference; the tests play the switch's half with the same primitives, which catches
-a handshake built in the wrong order but not a firmware that disagrees.
+field-tested reference; the tests play the switch's half with the same primitives, end to end
+through both the runtime path and the setup flow, which catches a handshake built in the wrong
+order but not a firmware that disagrees. The discovery query is TP-Link's own — take the bytes
+from `python-kasa`'s `discover.py` rather than from this file if you are checking them.
 
 ## Building
 

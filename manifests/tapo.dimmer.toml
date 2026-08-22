@@ -21,27 +21,12 @@ primary = true
 name = "Dimmer"
 capabilities = { dimmer = true, min_on_level = 1, max_on_level = 100 }
 
-# KLAP is HTTP on port 80, but the bodies are raw seeds and AES ciphertext and the session id
-# arrives in a `Set-Cookie` — none of which survives `HostCall::Http`, whose body is a `String`
-# both ways and which does not hand a driver the response headers. So this is a held connection
-# carrying framed bytes, and `src/http.rs` owns the framing. See its module doc.
-#
-# No `keepalive`: it would have core replay the last thing written whenever the socket drops,
-# and the last thing written here is as likely to be `set_device_info` as a handshake. A light
-# that turns itself on when a connection blips is worse than a command that has to be retried.
+# A network device on port 80, and nothing more than that: KLAP goes out as `HostCall::Http`,
+# which core owns end to end. This block used to declare `binary` and carry a `probe`, because
+# neither the request nor the discovery could be expressed any other way — see the README.
 [[transport]]
 kind = "network"
 port = 80
-binary = true
-# What finds one of these on a network it does not announce itself on. Handshake1 is the ideal
-# knock and is exactly the exchange `Probe` describes: it needs no credentials, it grants
-# nothing — the reply proves only that the *device* holds an account, and the seed below is a
-# constant precisely because nothing is done with what comes back — and a Tapo answers it by
-# opening a session, which is what puts `TP_SESSIONID` in the headers. Nothing else on port 80
-# in a house sends that cookie name, so a web server that answers is not mistaken for a switch.
-#
-# The body must be 16 bytes; these are 16 printable ones because a probe is declared as text.
-probe = { send = "POST /app/handshake1 HTTP/1.1\r\nHost: juno\r\nContent-Type: application/octet-stream\r\nContent-Length: 16\r\nConnection: close\r\n\r\njuno-discovery!!", expect = "TP_SESSIONID" }
 
 [[property]]
 name = "Address"
@@ -75,3 +60,18 @@ max = 900
 default = 30
 unit = "s"
 tooltip = "How often to ask the dimmer where it stands. Local, so this can be seconds."
+
+# How a Tapo is found, which is the only way a Tapo can be found: it announces nothing over
+# mDNS, SSDP or SDDP, and answers exactly one thing — TP-Link's own discovery broadcast, on the
+# vendor's own port, in the vendor's own format. This is the query their app sends and the one
+# `python-kasa` sends; the reply is a 16-byte header and then JSON.
+#
+# `expect` is not decoration. One broadcast here is answered by every TP-Link device in the
+# house — Kasa plugs on the old protocol included — and they do not take this driver.
+# `mgt_encrypt_schm` is the block a Tapo sends and a legacy Kasa does not, and it is also the
+# thing worth having: it names the encryption scheme the device wants, which is how this driver
+# knows a unit is KLAP rather than guessing. See `Tapo::from_broadcast`.
+[[discovery.udp]]
+port = 20002
+send_hex = "020000010200000000000000463cb5d3"
+expect = "mgt_encrypt_schm"
