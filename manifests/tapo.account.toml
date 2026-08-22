@@ -1,0 +1,54 @@
+[driver]
+id = "tapo.account"
+name = "TP-Link Account"
+manufacturer = "TP-Link"
+version = "1.0.0"
+runtime = "wasm"
+# Names the package. The dimmers are what somebody actually wanted, but this is what has to
+# exist first, and a catalog should lead with the thing you install.
+primary = true
+
+# Not a hub. There is no box in a cupboard here — a TP-Link account is a login, and the devices
+# behind it talk to the controller directly and never to it.
+#
+# `bridge` all the same, because the contract's *reason* fits exactly even where its examples do
+# not: "a device in its own right so that the things every child needs — an address, a paired
+# key — are held in one place. Change it once and every bulb behind it follows; without this
+# each would carry its own copy and they would drift." Substitute the account for the address
+# and that is precisely the problem this solves. Eight dimmers were eight copies of one
+# password, and changing it meant editing eight devices and missing one.
+[[proxy]]
+id = 1
+type = "bridge"
+primary = true
+name = "TP-Link Account"
+capabilities = { child_driver = "tapo.dimmer" }
+
+# The credentials, held once. Every dimmer inherits them — see `parent` in `tapo.dimmer`.
+#
+# Worth being plain about what these are, because they are not what most local integrations
+# ask for: this is the TP-Link *cloud account*, and a Tapo checks local control against it
+# because it stored a hash of it when the app first set it up. There is no per-device secret to
+# issue instead, no pairing button, and nothing to revoke afterwards. The controller never
+# sends them anywhere but to the devices on your own network.
+[[property]]
+name = "Email"
+type = "string"
+required = true
+tooltip = "The TP-Link account your Tapo devices are paired to."
+
+[[property]]
+name = "Password"
+type = "password"
+required = true
+tooltip = "That account's password. Checked against a device on your network, never against TP-Link."
+
+# Finding a Tapo on the network is what says you need this driver — the devices answer the
+# broadcast, the account answers nothing, because it is not a thing on a network. So the
+# discovery rule lives here rather than on the dimmer: a controller that sees one of these
+# should offer the account, which is the thing that has to be set up first and the thing that
+# then adds every dimmer at once.
+[[discovery.udp]]
+port = 20002
+send_hex = "020000010200000000000000463cb5d3"
+expect = "mgt_encrypt_schm"

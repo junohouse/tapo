@@ -8,28 +8,35 @@ One `light` proxy, dimmable 1–100. No continuous ramp: the switch fades on a s
 the device and has no "go up until I say stop", so `ramp_start`/`ramp_stop` say so rather than
 doing nothing. No button events either — the paddle works, and nothing local reports a press.
 
-## Setup
+## Two drivers: an account, and the dimmers behind it
 
-Discovery is a broadcast, not an announcement: a Tapo advertises nothing over mDNS, SSDP or
-SDDP, and answers exactly one thing — TP-Link's own discovery query, on UDP 20002, in TP-Link's
-own format. That query and the reply that identifies one are declared in the manifest as
-`[[discovery.udp]]`, and core does the sending and the listening. It runs against the whole
-registry index, so a controller with this driver *not* installed still lists the dimmer.
+The credentials a Tapo checks are a TP-Link **account**, not a per-device secret — the switch
+stored a hash of it when the Tapo app set it up, and local control is checked against that. A
+house with eight dimmers has one account, so it is its own device (`tapo.account`, a `bridge`)
+and every dimmer inherits from it, exactly as a Hue bulb inherits its bridge's address and key.
+Change the password once and all eight follow; without it, eight copies drift and one gets
+missed.
 
-The reply is worth more than an address. It names the model — which is why the sign-in screen
-knows what it is asking about — and it names the encryption scheme the device wants, so a unit
-that is not on KLAP is refused with a sentence saying so rather than adopted and left failing to
-log in forever.
+It is not a hub — there is no box, and the dimmers talk to the controller directly. `bridge` is
+the contract for "the thing children inherit from", which is precisely what this is.
 
-Setup then asks for the **TP-Link account** the dimmer is paired to: the email and password you
-sign in to the Tapo app with. That is not a per-device secret and there is no pairing flow to
-issue a token — the switch stores a hash of those credentials when the app sets it up, and local
-control is checked against it. There is nothing to revoke afterwards, which is worth knowing
-before typing them in.
+**Adding them.** Set up the account once; it is checked against a real device on the network
+before it is saved, because an account cannot be verified on its own and a typo would otherwise
+surface later as every dimmer refusing to answer. Then browse the account: it broadcasts, logs
+in to everything that answers, and adds each dimmer under the name you gave it in the Tapo app.
+Nothing is typed — not a password per device, and not an address at all.
 
-They are checked before anything is adopted. The handshake makes the switch prove it holds the
-same account before Juno proves it does, so a wrong password fails here with a sentence saying
-so, rather than adopting a dimmer that never answers a command.
+Addresses come from TP-Link's own discovery broadcast (`[[discovery.udp]]` on the account), the
+same one the Tapo app and `python-kasa` send. An address field appears only when the broadcast
+found nothing, which is real — a broadcast does not cross a router — and is then the only way
+through.
+
+A device that answers saying it speaks an older protocol, is unplugged, or is paired to a
+different account is left out and named on screen rather than failing the run. One legacy plug
+on the network must not be the reason seven dimmers cannot be added.
+
+There is no OAuth here and there cannot be: the dimmer validates the login itself, offline,
+against the hash it stored. No token from TP-Link's cloud is something it has any way to check.
 
 ## Polling is not optional
 
