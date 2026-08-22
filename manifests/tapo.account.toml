@@ -43,12 +43,24 @@ type = "password"
 required = true
 tooltip = "That account's password. Checked against a device on your network, never against TP-Link."
 
-# Finding a Tapo on the network is what says you need this driver — the devices answer the
-# broadcast, the account answers nothing, because it is not a thing on a network. So the
-# discovery rule lives here rather than on the dimmer: a controller that sees one of these
-# should offer the account, which is the thing that has to be set up first and the thing that
-# then adds every dimmer at once.
+# What answers this is a *dimmer*. The account answers nothing, because an account is not a
+# thing with an address — so the rule that finds a dimmer lives here, on the driver that has to
+# be installed and signed into before any dimmer can be added at all.
+#
+# `adopt_as` is what makes that two answers to one sighting rather than a lie. With no account
+# in the project, finding a Tapo offers *this* driver: sign in first, there is nothing else to
+# be done with it. Once an account exists, the same find offers the dimmer, adopted behind that
+# account without anybody choosing a parent. Discovery finds the hub, and after that it finds
+# the lights.
+[discovery]
+adopt_as = "tapo.dimmer"
+
+# TP-Link's own discovery query, byte for byte from `python-kasa`'s `discover.py` — the same
+# packet the Tapo app sends. The trailing four bytes are a checksum over the rest, and the
+# whole thing is a published constant rather than something to derive: a packet assembled from
+# a plausible-looking description is dropped by the device without a word, which is exactly
+# what happened to the first version of this line.
 [[discovery.udp]]
 port = 20002
-send_hex = "020000010200000000000000463cb5d3"
+send_hex = "020000010000000000000000463cb5d3"
 expect = "mgt_encrypt_schm"

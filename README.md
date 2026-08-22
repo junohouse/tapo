@@ -20,16 +20,22 @@ missed.
 It is not a hub — there is no box, and the dimmers talk to the controller directly. `bridge` is
 the contract for "the thing children inherit from", which is precisely what this is.
 
-**Adding them.** Set up the account once; it is checked against a real device on the network
-before it is saved, because an account cannot be verified on its own and a typo would otherwise
-surface later as every dimmer refusing to answer. Then browse the account: it broadcasts, logs
-in to everything that answers, and adds each dimmer under the name you gave it in the Tapo app.
-Nothing is typed — not a password per device, and not an address at all.
+**Adding them.** Set up the account first — two fields, no network scan, nothing to wait for.
+Then browse it: it broadcasts, logs in to everything that answers, and adds each dimmer under
+the name you gave it in the Tapo app. Nothing is typed, not a password per device and not an
+address at all.
 
-Addresses come from TP-Link's own discovery broadcast (`[[discovery.udp]]` on the account), the
-same one the Tapo app and `python-kasa` send. An address field appears only when the broadcast
-found nothing, which is real — a broadcast does not cross a router — and is then the only way
-through.
+The account is saved without being checked, deliberately: there is nothing to ask an account on
+its own, and testing it would mean a broadcast and a wait in a wizard that would then fail on
+any network whose devices sit on another subnet. Browsing is the next thing anybody does and it
+checks every device it finds, so a wrong password is one screen away rather than saved silently.
+
+**Discovery is two-staged.** The account declares `[discovery] adopt_as = "tapo.dimmer"`: what
+answers TP-Link's broadcast is a dimmer, and the account answers nothing, because a login is not
+a thing with an address. So with no account set up, finding a Tapo offers *the account* — that
+is the only thing that can be done with it. Once one exists, the same find offers the dimmer,
+adopted behind it with no parent to choose. Discovery finds the hub, and after that it finds the
+lights.
 
 A device that answers saying it speaks an older protocol, is unplugged, or is paired to a
 different account is left out and named on screen rather than failing the run. One legacy plug

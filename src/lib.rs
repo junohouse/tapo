@@ -642,74 +642,43 @@ impl Tapo {
                 Self::walk(state, found, &email, &password)
             }
 
-            // A fresh account.
-            "start" => Self::ask_account(state, None),
+            // A fresh account. Nothing to look at first: the only thing this screen needs is
+            // two credentials, and core does not broadcast for a driver whose rules find its
+            // children rather than itself — see `[discovery] adopt_as` in the manifest.
+            "start" => Self::ask_account(None),
 
             "account" => {
                 let (Some(email), Some(password)) = (s("email"), s("password")) else {
                     // The thing that used to silently redraw. Say which half is missing.
-                    return Self::ask_account(
-                        state,
-                        Some(match (s("email"), s("password")) {
-                            (None, None) => "Both are needed.",
-                            (None, _) => "The email is needed.",
-                            _ => "The password is needed.",
-                        }),
-                    );
+                    return Self::ask_account(Some(match (s("email"), s("password")) {
+                        (None, None) => "Both are needed.",
+                        (None, _) => "The email is needed.",
+                        _ => "The password is needed.",
+                    }));
                 };
-                // Checked against a real device, because an account cannot be checked on its
-                // own — there is nothing to ask. With nothing on the network to check against,
-                // it is saved unverified rather than refused: the devices may be on another
-                // subnet, and a wrong password shows up as a dimmer that will not answer.
-                match Self::usable(state).first() {
-                    Some(address) => {
-                        let seed = klap::local_seed();
-                        (
-                            SetupStep::Fetch {
-                                request: HttpRequest::new(
-                                    "POST",
-                                    format!("http://{address}{HANDSHAKE1}"),
-                                )
-                                .bytes(seed.to_vec()),
-                                note: "checking the account against a device".into(),
-                            },
-                            json!({
-                                "phase": "check", "email": email, "password": password,
-                                "local_seed": hex(&seed), "at": 0, "queue": [address],
-                                "udp_candidates": state.get("udp_candidates").cloned(),
-                            }),
-                        )
-                    }
-                    None => Self::account_done(&email, &password, false),
-                }
-            }
-
-            "check" => {
-                let (Some(seed), Some(email), Some(password)) = (
-                    s("local_seed").and_then(|h| unhex(&h)),
-                    s("email"),
-                    s("password"),
-                ) else {
-                    return Self::lost();
-                };
-                let Ok(seed) = <[u8; 16]>::try_from(seed) else {
-                    return Self::lost();
-                };
-                if status() != 200 {
-                    // The device did not answer, which says nothing about the account.
-                    return Self::account_done(&email, &password, false);
-                }
-                let auth = klap::auth_hash(&email, &password);
-                match klap::accept_handshake1(&seed, &auth, &received()) {
-                    Some(_) => Self::account_done(&email, &password, true),
-                    None => Self::ask_account(
-                        state,
-                        Some(
-                            "A dimmer on this network refused that account. It wants the email \
-                             and password you sign in to the Tapo app with.",
-                        ),
-                    ),
-                }
+                // Saved without being checked, deliberately. An account has nothing to ask on
+                // its own — the only way to test one is to log in to a device — and doing that
+                // here would mean a broadcast, a wait, and a wizard that fails on a network
+                // whose devices sit on another subnet. Browsing this account is the next thing
+                // anybody does and it checks every device it finds, so a wrong password is one
+                // screen away rather than saved silently forever.
+                let mut properties = std::collections::BTreeMap::new();
+                properties.insert("Email".into(), json!(email));
+                properties.insert("Password".into(), json!(password));
+                (
+                    SetupStep::done(vec![Candidate {
+                        // The account, not the person. An email address as a device name puts
+                        // it on every screen in the house that lists hardware; which account
+                        // this is belongs on its settings page, where the field it came from
+                        // already is.
+                        label: "TP-Link Account".into(),
+                        driver_id: "tapo.account".into(),
+                        properties,
+                        verified: "saved — checked when its devices are added".into(),
+                        ..Default::default()
+                    }]),
+                    Value::Null,
+                )
             }
 
             "hs1" => {
@@ -845,35 +814,24 @@ impl Tapo {
 
     // -- the account ---------------------------------------------------------------------
 
-    /// Ask for the account. Two fields, and a sentence.
-    fn ask_account(state: &Value, problem: Option<&str>) -> (SetupStep, Value) {
-        let found = Self::usable(state).len();
-        let body = match (problem, found) {
-            (Some(problem), _) => problem.to_string(),
-            // What is on the network is worth one clause, because it is the difference between
-            // "this will work" and "nothing here answered".
-            (None, 0) => "The account your Tapo devices are paired to — the one you sign in to \
-                          the Tapo app with. Every device shares it, so it is asked once."
-                .into(),
-            (None, 1) => "Found 1 Tapo device. Sign in with the account it is paired to — the \
-                          one you use in the Tapo app."
-                .into(),
-            (None, n) => format!(
-                "Found {n} Tapo devices. Sign in with the account they are paired to — the one \
-                 you use in the Tapo app."
-            ),
-        };
+    /// Ask for the account. Two fields and one sentence.
+    fn ask_account(problem: Option<&str>) -> (SetupStep, Value) {
         (
             SetupStep::Form {
                 title: "TP-Link account".into(),
-                body,
+                body: problem
+                    .unwrap_or(
+                        "The account your Tapo devices are paired to — the one you sign in to \
+                         the Tapo app with. Every device shares it, so it is asked once.",
+                    )
+                    .into(),
                 fields: vec![
                     Field {
                         name: "email".into(),
                         label: "Email".into(),
                         kind: "string".into(),
                         help: String::new(),
-                        default: state.get("email").cloned(),
+                        default: None,
                         options: Vec::new(),
                         required: true,
                     },
@@ -888,33 +846,7 @@ impl Tapo {
                     },
                 ],
             },
-            json!({
-                "phase": "account",
-                "udp_candidates": state.get("udp_candidates").cloned(),
-            }),
-        )
-    }
-
-    /// The account itself, ready to adopt. Its dimmers are added by browsing it afterwards.
-    fn account_done(email: &str, password: &str, checked: bool) -> (SetupStep, Value) {
-        let mut properties = std::collections::BTreeMap::new();
-        properties.insert("Email".into(), json!(email));
-        properties.insert("Password".into(), json!(password));
-        (
-            SetupStep::done(vec![Candidate {
-                label: email.to_string(),
-                driver_id: "tapo.account".into(),
-                properties,
-                verified: if checked {
-                    "signed in to a device on this network".into()
-                } else {
-                    // Said plainly rather than implied: nothing was proved, and the first sign
-                    // of a wrong password will be a dimmer that does not answer.
-                    "not checked — no device answered to check against".into()
-                },
-                ..Default::default()
-            }]),
-            Value::Null,
+            json!({ "phase": "account" }),
         )
     }
 
@@ -1518,82 +1450,74 @@ mod tests {
         tapo.setup("tapo.account", &state, &fetched(200, &framed, false))
     }
 
-    /// The account is asked for once, and checked against a real device before it is saved.
+    /// The account screen is two fields and asks the network nothing.
     ///
-    /// The checking is the part worth having: an account cannot be verified on its own — there
-    /// is nothing to ask — so without this a typo would be saved happily and show up later as
-    /// every dimmer in the house refusing to answer.
+    /// It used to broadcast first, to count devices for the wording and to pick one to check
+    /// the password against — three seconds of waiting in front of somebody who opened it to
+    /// type an email. Core no longer scans for a driver whose rules find its children, and the
+    /// checking moved to where the devices actually are.
     #[test]
-    fn the_account_is_asked_for_once_and_checked_against_a_device() {
+    fn the_account_screen_is_two_fields_and_touches_nothing() {
         let tapo = Tapo;
-        let auth = klap::auth_hash(EMAIL, PASSWORD);
-        let state = seen(&[("10.0.0.4", "S500D", "KLAP")]);
-
-        let (step, state) = tapo.discover("tapo.account", &state, &Args::new());
+        // Deliberately no `udp_candidates`: this screen must not need them.
+        let (step, state) = tapo.discover("tapo.account", &json!({}), &Args::new());
         let SetupStep::Form { title, body, fields } = &step else {
             panic!("expected a form, got {step:?}");
         };
         assert_eq!(title, "TP-Link account");
-        assert!(body.contains("Found 1 Tapo device"), "{body}");
-        // Two fields, and no address: the broadcast already knows where everything is.
         assert_eq!(
             fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
-            vec!["email", "password"]
+            vec!["email", "password"],
+            "no address: the broadcast knows where everything is"
         );
+        assert!(body.len() < 160, "one sentence, not a wall: {body}");
 
         let mut input = Args::new();
         input.insert("email".into(), json!(EMAIL));
         input.insert("password".into(), json!(PASSWORD));
-        let (step, state) = tapo.setup("tapo.account", &state, &input);
-        let SetupStep::Fetch { request, .. } = &step else {
-            panic!("expected the account to be checked, got {step:?}");
-        };
-        assert_eq!(request.url, "http://10.0.0.4/app/handshake1");
-        let local: [u8; 16] = request.body_bytes.clone().try_into().unwrap();
-
-        let (step, _) = tapo.setup(
-            "tapo.account",
-            &state,
-            &fetched(200, &hs1_reply(&local, &[9u8; 16], &auth), true),
-        );
+        let (step, _) = tapo.setup("tapo.account", &state, &input);
         let SetupStep::Done { devices, .. } = step else {
-            panic!("expected the account, got {step:?}");
+            panic!("expected the account straight away, got {step:?}");
         };
+        // The account, not the person. An email as a device name would put it on every screen
+        // in the house that lists hardware.
+        assert_eq!(devices[0].label, "TP-Link Account");
         assert_eq!(devices[0].driver_id, "tapo.account");
-        assert_eq!(devices[0].label, EMAIL);
         assert_eq!(devices[0].properties["Email"], json!(EMAIL));
         assert_eq!(devices[0].properties["Password"], json!(PASSWORD));
-        assert!(devices[0].verified.contains("signed in"), "{}", devices[0].verified);
     }
 
-    /// A wrong password is caught here rather than saved onto every device behind it.
+    /// A wrong password is caught the moment its devices are added, and named as such.
+    ///
+    /// This is what pays for not checking it at sign-in: the check happens where there is
+    /// something to check against, and every device says the same thing, so the reason is not
+    /// in doubt.
     #[test]
-    fn an_account_a_device_refuses_is_asked_for_again() {
+    fn an_account_every_device_refuses_fails_with_the_reason() {
         let tapo = Tapo;
-        let state = seen(&[("10.0.0.4", "S500D", "KLAP")]);
-        let (_, state) = tapo.discover("tapo.account", &state, &Args::new());
+        let mut state = seen(&[("10.0.0.4", "S500D", "KLAP")]);
+        state["browse"] = json!(true);
+        state["Email"] = json!(EMAIL);
+        state["Password"] = json!("not the password");
 
-        let mut input = Args::new();
-        input.insert("email".into(), json!(EMAIL));
-        input.insert("password".into(), json!("not the password"));
-        let (step, state) = tapo.setup("tapo.account", &state, &input);
+        let (step, state) = tapo.discover("tapo.account", &state, &Args::new());
         let SetupStep::Fetch { request, .. } = &step else { panic!("{step:?}") };
         let local: [u8; 16] = request.body_bytes.clone().try_into().unwrap();
 
-        // The device computed its half from the account it was actually set up with.
+        // The device computed its half from the account it was really set up with.
         let real = klap::auth_hash(EMAIL, PASSWORD);
         let (step, _) = tapo.setup(
             "tapo.account",
             &state,
             &fetched(200, &hs1_reply(&local, &[9u8; 16], &real), true),
         );
-        let SetupStep::Form { body, .. } = &step else {
-            panic!("expected to be asked again, got {step:?}");
+        let SetupStep::Failed { reason } = step else {
+            panic!("expected a refusal, got {step:?}");
         };
-        assert!(body.contains("refused that account"), "{body}");
+        assert!(reason.contains("different TP-Link account"), "{reason}");
     }
 
-    /// The bug somebody actually hit: a form submitted with a field empty redisplayed itself
+    /// The bug somebody actually hit:    /// The bug somebody actually hit: a form submitted with a field empty redisplayed itself
     /// with no explanation, which reads as a dead button. Core does not enforce `required`.
     #[test]
     fn a_form_submitted_empty_says_what_is_missing() {
@@ -1681,18 +1605,13 @@ mod tests {
     #[test]
     fn a_device_on_the_old_protocol_is_left_out() {
         let tapo = Tapo;
-        let state = seen(&[("10.0.0.4", "S500D", "KLAP"), ("10.0.0.9", "HS100", "AES")]);
-
-        // The count on the sign-in screen is of devices this driver can actually drive.
-        let (step, _) = tapo.discover("tapo.account", &state, &Args::new());
-        let SetupStep::Form { body, .. } = &step else { panic!("{step:?}") };
-        assert!(body.contains("Found 1 Tapo device"), "{body}");
-
-        // And the walk never tries it.
-        let mut browsing = state.clone();
+        let mut browsing = seen(&[("10.0.0.9", "HS100", "AES"), ("10.0.0.4", "S500D", "KLAP")]);
         browsing["browse"] = json!(true);
         browsing["Email"] = json!(EMAIL);
         browsing["Password"] = json!(PASSWORD);
+
+        // The walk never tries the one that said it speaks something else, even though it
+        // answered the same broadcast and is first in the list.
         let (step, _) = tapo.discover("tapo.account", &browsing, &Args::new());
         let SetupStep::Fetch { request, .. } = &step else { panic!("{step:?}") };
         assert!(request.url.contains("10.0.0.4"), "{}", request.url);
