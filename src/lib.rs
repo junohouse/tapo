@@ -523,9 +523,25 @@ impl Tapo {
 impl Tapo {
     /// The same flow whether it was reached from a survey or from Add device.
     ///
-    /// It ends by actually logging in, not by confirming the address answers: the one thing
-    /// that goes wrong here is the TP-Link account, and a dimmer adopted with the wrong
-    /// password looks identical to a working one until somebody presses a button.
+    /// # One password, every dimmer
+    ///
+    /// The credentials are a **TP-Link account**, not a per-device secret, so a house with
+    /// eight of these has one answer to give and not eight. This asks once and then walks the
+    /// list the broadcast found, logging in to each in turn and collecting what it calls
+    /// itself, so what comes back is eight named devices rather than eight wizards.
+    ///
+    /// Which is also why nobody types an address. A Tapo answers TP-Link's discovery broadcast
+    /// with its own IP, its model and its MAC — see `[[discovery.udp]]` in the manifest — so an
+    /// address is something core already knows by the time this opens. The field only appears
+    /// when the broadcast found nothing at all, which happens on a network that does not
+    /// forward it: lighting on its own VLAN, or a controller on the wrong side of a router.
+    ///
+    /// # Failing one device must not fail the rest
+    ///
+    /// A wrong password is a wrong password and the *first* device to say so ends the flow —
+    /// there is no point walking eight of them to be refused eight times. Anything after that
+    /// is treated as this one unit's problem: unplugged, mid-reboot, on old firmware. It is
+    /// skipped, named in the summary, and the rest carry on.
     fn flow(&self, state: &Value, input: &Args) -> (SetupStep, Value) {
         let phase = state.get("phase").and_then(Value::as_str).unwrap_or("start");
         // Empty is absent. A form prefilled with an address nobody had yet writes `""` into the
@@ -548,129 +564,81 @@ impl Tapo {
                 })
                 .unwrap_or_default()
         };
+        // Which device this leg of the walk is talking to.
+        let at = state.get("at").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let queue: Vec<String> = state
+            .get("queue")
+            .and_then(Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let here = queue.get(at).cloned().unwrap_or_default();
 
         match phase {
             "start" => {
-                // What the broadcast already found, if this was reached by pressing Add on a
-                // row. A Tapo announces nothing over mDNS or SSDP — see the manifest — so this
-                // is the only kind of candidate that ever arrives here.
-                let found = state.get("udp_candidates").and_then(Value::as_array);
-                let chosen = s("chosen_address").or_else(|| {
-                    found
-                        .filter(|rows| rows.len() == 1)
-                        .and_then(|rows| rows.first())
-                        .and_then(|row| row.get("address"))
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                });
-
-                // What the device said about itself in that reply. Only ever a nicety for the
-                // address — except `encrypt_type`, which is the one thing a driver otherwise
-                // has to guess at, and guessing wrong looks like a dimmer that refuses a
-                // password somebody typed correctly.
-                let broadcast = chosen
-                    .as_deref()
-                    .and_then(|address| Self::from_broadcast(state, address));
-                if let Some(scheme) = broadcast
-                    .as_ref()
-                    .and_then(|info| info.get("mgt_encrypt_schm"))
-                    .and_then(|s| s.get("encrypt_type"))
-                    .and_then(Value::as_str)
-                    && !scheme.eq_ignore_ascii_case("KLAP")
-                {
-                    return (
-                        SetupStep::Failed {
-                            reason: format!(
-                                "This device says it speaks `{scheme}`, and this driver speaks \
-                                 KLAP. That is the protocol current Tapo firmware uses — a unit \
-                                 old enough to want something else needs a firmware update from \
-                                 the Tapo app, or a driver that has been tested against it."
-                            ),
-                        },
-                        Value::Null,
-                    );
-                }
-
-                match chosen {
-                    Some(address) => Self::ask_credentials(&address, broadcast),
-                    None if found.is_some_and(|rows| rows.len() > 1) => (
-                        SetupStep::Pick {
-                            title: "Which dimmer?".into(),
-                            body: "These answered TP-Link's discovery broadcast.".into(),
-                            columns: vec!["Address".into(), "Model".into()],
-                            rows: found
-                                .into_iter()
-                                .flatten()
-                                .filter_map(|row| {
-                                    let address =
-                                        row.get("address").and_then(Value::as_str)?.to_string();
-                                    let model = Self::from_broadcast(state, &address)
-                                        .and_then(|i| {
-                                            i.get("device_model")
-                                                .and_then(Value::as_str)
-                                                .map(str::to_string)
-                                        })
-                                        .unwrap_or_default();
-                                    Some(PickRow {
-                                        value: address.clone(),
-                                        cells: vec![address, model],
-                                        note: String::new(),
-                                    })
-                                })
-                                .collect(),
-                            field: "address".into(),
-                            manual: Some(Field {
-                                name: "address".into(),
-                                label: "Address".into(),
-                                kind: "string".into(),
-                                help: "if the dimmer is not listed".into(),
-                                default: None,
-                                options: Vec::new(),
-                                required: true,
-                            }),
-                        },
-                        json!({ "phase": "picked", "udp_candidates": state.get("udp_candidates") }),
-                    ),
-                    // Nothing found, which is ordinary: a broadcast does not cross a subnet,
-                    // and plenty of houses put lighting on its own.
-                    None => Self::ask_credentials("", None),
-                }
-            }
-
-            "picked" => {
-                let address = s("address").unwrap_or_default();
-                let broadcast = Self::from_broadcast(state, &address);
-                Self::ask_credentials(&address, broadcast)
-            }
-
-            // Address and account in hand. Prove them.
-            "credentials" => {
-                let (Some(address), Some(email), Some(password)) =
-                    (s("address"), s("email"), s("password"))
-                else {
-                    return Self::ask_credentials(&s("address").unwrap_or_default(), None);
+                // Everything the broadcast turned up. `chosen_address` means somebody pressed
+                // Add on one particular row, so that is the whole list; otherwise it is every
+                // Tapo on the network and they all take the same account.
+                let all: Vec<String> = state
+                    .get("udp_candidates")
+                    .and_then(Value::as_array)
+                    .map(|rows| {
+                        rows.iter()
+                            .filter_map(|r| r.get("address").and_then(Value::as_str))
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let found: Vec<String> = match s("chosen_address") {
+                    Some(one) => vec![one],
+                    None => all,
                 };
-                let address = address.trim().to_string();
-                let seed = klap::local_seed();
-                (
-                    SetupStep::Fetch {
-                        request: HttpRequest::new(
-                            "POST",
-                            format!("http://{address}{HANDSHAKE1}"),
-                        )
-                        .bytes(seed.to_vec()),
-                        note: "saying hello to the dimmer".into(),
-                    },
-                    json!({
-                        "phase": "hs1", "address": address, "email": email,
-                        "password": password, "local_seed": hex(&seed),
-                        "model": s("model"),
-                    }),
-                )
+
+                // A device that answered the broadcast saying it speaks something else is not
+                // one this driver can drive, and it is better to leave it out of the list than
+                // to fail against it later with a message about passwords.
+                let (usable, wrong_protocol): (Vec<String>, Vec<String>) =
+                    found.into_iter().partition(|address| {
+                        Self::from_broadcast(state, address)
+                            .and_then(|info| {
+                                info.get("mgt_encrypt_schm")?
+                                    .get("encrypt_type")?
+                                    .as_str()
+                                    .map(|s| s.eq_ignore_ascii_case("KLAP"))
+                            })
+                            // Unstated is not a refusal: a reply this driver could not read is
+                            // no evidence either way, and the handshake will settle it.
+                            .unwrap_or(true)
+                    });
+
+                Self::ask_credentials(state, usable, wrong_protocol)
+            }
+
+            // Account in hand. Start on the first device.
+            "credentials" => {
+                let (Some(email), Some(password)) = (s("email"), s("password")) else {
+                    return Self::ask_credentials(state, Vec::new(), Vec::new());
+                };
+                // Typed in by hand, because the broadcast found nothing.
+                let queue = match s("address") {
+                    Some(address) => vec![address.trim().to_string()],
+                    None => queue,
+                };
+                if queue.is_empty() {
+                    return Self::ask_credentials(state, Vec::new(), Vec::new());
+                }
+                let mut next = state.clone();
+                next["email"] = json!(email);
+                next["password"] = json!(password);
+                next["queue"] = json!(queue);
+                next["at"] = json!(0);
+                Self::greet(next)
             }
 
             "hs1" => {
-                let address = s("address").unwrap_or_default();
                 let (Some(seed), Some(email), Some(password)) = (
                     s("local_seed").and_then(|h| unhex(&h)),
                     s("email"),
@@ -682,31 +650,38 @@ impl Tapo {
                     return Self::lost();
                 };
                 if status() != 200 {
-                    return (
-                        SetupStep::Failed {
-                            reason: format!(
-                                "{address} answered {} to a Tapo handshake. Check the address — \
-                                 it is under Device Info in the Tapo app.",
-                                status()
-                            ),
-                        },
-                        Value::Null,
+                    return Self::give_up_on(
+                        state,
+                        at,
+                        format!("{here} answered {} to a Tapo handshake", status()),
                     );
                 }
                 let auth = klap::auth_hash(email.trim(), &password);
                 let Some(remote) = klap::accept_handshake1(&seed, &auth, &received()) else {
-                    return (
-                        SetupStep::Failed {
-                            reason: "The dimmer did not accept that TP-Link account. It wants \
-                                     the email and password you sign in to the Tapo app with — \
-                                     the same account the dimmer is paired to."
-                                .into(),
-                        },
-                        Value::Null,
+                    // The device computed its half from the credentials it was set up with and
+                    // got a different answer. If this is the first device, that is the password
+                    // and nothing about continuing helps.
+                    if at == 0 {
+                        return (
+                            SetupStep::Failed {
+                                reason: "The dimmer did not accept that TP-Link account. It \
+                                         wants the email and password you sign in to the Tapo \
+                                         app with — the same account the dimmer is paired to."
+                                    .into(),
+                            },
+                            Value::Null,
+                        );
+                    }
+                    // A later one refusing the account that just worked is a device somebody
+                    // set up under a different one.
+                    return Self::give_up_on(
+                        state,
+                        at,
+                        format!("{here} is paired to a different TP-Link account"),
                     );
                 };
                 let cookie = setup_cookie(input).unwrap_or_default();
-                let mut request = HttpRequest::new("POST", format!("http://{address}{HANDSHAKE2}"))
+                let mut request = HttpRequest::new("POST", format!("http://{here}{HANDSHAKE2}"))
                     .bytes(klap::handshake2(&seed, &remote, &auth).to_vec());
                 if !cookie.is_empty() {
                     request = request.header("cookie", format!("TP_SESSIONID={cookie}"));
@@ -718,7 +693,7 @@ impl Tapo {
                 (
                     SetupStep::Fetch {
                         request,
-                        note: "signing in".into(),
+                        note: format!("signing in to {here}"),
                     },
                     next,
                 )
@@ -726,11 +701,10 @@ impl Tapo {
 
             "hs2" => {
                 if status() != 200 {
-                    return (
-                        SetupStep::Failed {
-                            reason: format!("The dimmer rejected the login ({}).", status()),
-                        },
-                        Value::Null,
+                    return Self::give_up_on(
+                        state,
+                        at,
+                        format!("{here} rejected the login ({})", status()),
                     );
                 }
                 let (Some(local), Some(remote), Some(email), Some(password)) = (
@@ -750,13 +724,10 @@ impl Tapo {
                 let mut session = klap::Session::derive(&local, &remote, &auth);
                 let (seq, framed) = session.encrypt(GET.as_bytes());
                 let (key, iv, sig) = session.parts();
-                let address = s("address").unwrap_or_default();
                 let cookie = s("cookie").unwrap_or_default();
-                let mut request = HttpRequest::new(
-                    "POST",
-                    format!("http://{address}{REQUEST}?seq={seq}"),
-                )
-                .bytes(framed);
+                let mut request =
+                    HttpRequest::new("POST", format!("http://{here}{REQUEST}?seq={seq}"))
+                        .bytes(framed);
                 if !cookie.is_empty() {
                     request = request.header("cookie", format!("TP_SESSIONID={cookie}"));
                 }
@@ -769,14 +740,13 @@ impl Tapo {
                 (
                     SetupStep::Fetch {
                         request,
-                        note: "asking the dimmer what it is".into(),
+                        note: format!("asking {here} what it is"),
                     },
                     next,
                 )
             }
 
             "info" => {
-                let address = s("address").unwrap_or_default();
                 let (Some(key), Some(iv), Some(sig), Some(seq)) = (
                     s("key").and_then(|h| unhex(&h)),
                     s("iv").and_then(|h| unhex(&h)),
@@ -812,30 +782,33 @@ impl Tapo {
                     .get("model")
                     .and_then(Value::as_str)
                     .map(str::to_string)
-                    .or_else(|| s("model"))
+                    .or_else(|| {
+                        Self::from_broadcast(state, &here).and_then(|i| {
+                            i.get("device_model").and_then(Value::as_str).map(str::to_string)
+                        })
+                    })
                     .unwrap_or_else(|| "Tapo dimmer".into());
 
-                let mut properties = std::collections::BTreeMap::new();
-                properties.insert("Address".into(), json!(address));
-                properties.insert("Email".into(), json!(s("email").unwrap_or_default()));
-                properties.insert("Password".into(), json!(s("password").unwrap_or_default()));
-
-                (
-                    SetupStep::done(vec![Candidate {
-                        label: nickname.unwrap_or_else(|| format!("{model} at {address}")),
-                        driver_id: "tapo.dimmer".into(),
-                        properties,
-                        verified: match result.get("device_on").and_then(Value::as_bool) {
-                            Some(true) => format!("{model}, on"),
-                            Some(false) => format!("{model}, off"),
-                            // The login worked — that is what was being proved — even if the
-                            // reply after it was not readable.
-                            None => format!("{model}, signed in"),
-                        },
-                        ..Default::default()
-                    }]),
-                    Value::Null,
-                )
+                let mut next = state.clone();
+                let mut adopted = next
+                    .get("adopted")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                adopted.push(json!({
+                    "address": here,
+                    "label": nickname.unwrap_or_else(|| format!("{model} at {here}")),
+                    "verified": match result.get("device_on").and_then(Value::as_bool) {
+                        // The login worked — that is what was being proved — even if the reply
+                        // after it was not readable.
+                        None => format!("{model}, signed in"),
+                        Some(true) => format!("{model}, on"),
+                        Some(false) => format!("{model}, off"),
+                    },
+                }));
+                next["adopted"] = json!(adopted);
+                next["at"] = json!(at + 1);
+                Self::greet(next)
             }
 
             other => (
@@ -845,6 +818,107 @@ impl Tapo {
                 Value::Null,
             ),
         }
+    }
+
+    /// Say hello to the device at `at`, or finish if the list is done.
+    fn greet(mut state: Value) -> (SetupStep, Value) {
+        let at = state.get("at").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let queue: Vec<String> = state
+            .get("queue")
+            .and_then(Value::as_array)
+            .map(|rows| rows.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+
+        let Some(address) = queue.get(at) else {
+            return Self::finish(&state);
+        };
+        let seed = klap::local_seed();
+        state["phase"] = json!("hs1");
+        state["local_seed"] = json!(hex(&seed));
+        // Belonging to the *previous* device, and a stale one is worse than none: it would
+        // decrypt the next device's reply into noise rather than failing.
+        for key in ["remote_seed", "cookie", "key", "iv", "sig", "seq"] {
+            state.as_object_mut().map(|o| o.remove(key));
+        }
+        (
+            SetupStep::Fetch {
+                request: HttpRequest::new("POST", format!("http://{address}{HANDSHAKE1}"))
+                    .bytes(seed.to_vec()),
+                note: format!("saying hello to {address}"),
+            },
+            state,
+        )
+    }
+
+    /// This device is not going to work. Note why, and go on to the next one.
+    fn give_up_on(state: &Value, at: usize, why: String) -> (SetupStep, Value) {
+        let mut next = state.clone();
+        let mut skipped = next
+            .get("skipped")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        skipped.push(json!(why));
+        next["skipped"] = json!(skipped);
+        next["at"] = json!(at + 1);
+        Self::greet(next)
+    }
+
+    /// Everything that logged in, and what did not.
+    fn finish(state: &Value) -> (SetupStep, Value) {
+        let email = state.get("email").and_then(Value::as_str).unwrap_or_default();
+        let password = state.get("password").and_then(Value::as_str).unwrap_or_default();
+        let skipped: Vec<String> = state
+            .get("skipped")
+            .and_then(Value::as_array)
+            .map(|rows| rows.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+
+        let devices: Vec<Candidate> = state
+            .get("adopted")
+            .and_then(Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| {
+                        let address = row.get("address")?.as_str()?.to_string();
+                        let mut properties = std::collections::BTreeMap::new();
+                        properties.insert("Address".into(), json!(address));
+                        properties.insert("Email".into(), json!(email));
+                        properties.insert("Password".into(), json!(password));
+                        Some(Candidate {
+                            label: row.get("label")?.as_str()?.to_string(),
+                            driver_id: "tapo.dimmer".into(),
+                            properties,
+                            verified: row
+                                .get("verified")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            ..Default::default()
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Nothing logged in at all. That is a failure with a reason, not an empty list — an
+        // empty `Done` reads as "there is nothing out there", which is the one thing it is not.
+        if devices.is_empty() {
+            return (
+                SetupStep::Failed {
+                    reason: if skipped.is_empty() {
+                        "Nothing answered. Check that the dimmer is powered and on this network."
+                            .into()
+                    } else {
+                        format!("Nothing could be added. {}", skipped.join("; "))
+                    },
+                },
+                Value::Null,
+            );
+        }
+        // Some worked and some did not: the ones that did are still worth having, and the
+        // others are named rather than silently missing from a list nobody counted.
+        (SetupStep::done(devices), Value::Null)
     }
 
     /// What the device said when it answered the discovery broadcast, for one address.
@@ -872,60 +946,103 @@ impl Tapo {
         parsed.get("result").cloned()
     }
 
-    fn ask_credentials(address: &str, broadcast: Option<Value>) -> (SetupStep, Value) {
-        let model = broadcast
-            .as_ref()
-            .and_then(|i| i.get("device_model"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let body = if model.is_empty() {
-            "Tapo checks local control against the TP-Link account the switch is paired to. \
-             This is that account — the one you sign in to the Tapo app with — and it is \
-             checked here rather than taken on trust."
-                .to_string()
-        } else {
-            format!(
-                "This is a {model}. Tapo checks local control against the TP-Link account the \
-                 switch is paired to — the one you sign in to the Tapo app with — and it is \
-                 checked here rather than taken on trust."
-            )
+    /// Ask for the account — and for an address only if nobody found one.
+    ///
+    /// The address field is the interesting half. It is present exactly when the broadcast
+    /// turned up nothing, because in every other case core already knows the address and
+    /// asking would be asking somebody to go and read back a number that is on the screen
+    /// behind the wizard. A network that does not forward broadcasts is the case it exists
+    /// for, and on that network it is the only way through.
+    fn ask_credentials(
+        state: &Value,
+        found: Vec<String>,
+        wrong_protocol: Vec<String>,
+    ) -> (SetupStep, Value) {
+        // What the broadcast said each one is, for a screen that can then name them.
+        let described: Vec<String> = found
+            .iter()
+            .map(|address| {
+                match Self::from_broadcast(state, address)
+                    .and_then(|i| i.get("device_model").and_then(Value::as_str).map(str::to_string))
+                {
+                    Some(model) => format!("{model} at {address}"),
+                    None => address.clone(),
+                }
+            })
+            .collect();
+
+        let mut body = match described.len() {
+            0 => "Nothing answered TP-Link's discovery broadcast, so the address has to be \
+                  typed in — it is under Settings → Device Info in the Tapo app. A broadcast \
+                  does not cross a router, so this is the ordinary case when lighting is on \
+                  its own network."
+                .to_string(),
+            1 => format!("Found {}.", described[0]),
+            n => format!("Found {n} dimmers:\n\n- {}", described.join("\n- ")),
         };
+        body.push_str(
+            "\n\nTapo checks local control against the TP-Link account the switch is paired \
+             to — the one you sign in to the Tapo app with. It is the same account for every \
+             device, so this is asked once, and it is checked against each of them here rather \
+             than taken on trust.",
+        );
+        // Named rather than silently dropped: somebody who can count their dimmers should be
+        // able to see which one is missing and why.
+        if !wrong_protocol.is_empty() {
+            body.push_str(&format!(
+                "\n\nNot included: {} — these answered saying they speak an older protocol \
+                 than this driver does. A firmware update from the Tapo app may bring them over.",
+                wrong_protocol.join(", ")
+            ));
+        }
+
+        let mut fields = Vec::new();
+        if found.is_empty() {
+            fields.push(Field {
+                name: "address".into(),
+                label: "Address".into(),
+                kind: "string".into(),
+                help: "Tapo app → the dimmer → Settings → Device Info".into(),
+                default: None,
+                options: Vec::new(),
+                required: true,
+            });
+        }
+        fields.push(Field {
+            name: "email".into(),
+            label: "Email".into(),
+            kind: "string".into(),
+            help: "the TP-Link account".into(),
+            default: None,
+            options: Vec::new(),
+            required: true,
+        });
+        fields.push(Field {
+            name: "password".into(),
+            label: "Password".into(),
+            kind: "password".into(),
+            help: "that account's password".into(),
+            default: None,
+            options: Vec::new(),
+            required: true,
+        });
+
         (
             SetupStep::Form {
-                title: "Sign in to the dimmer".into(),
+                title: match found.len() {
+                    0 | 1 => "Sign in to the dimmer".into(),
+                    n => format!("Sign in to {n} dimmers"),
+                },
                 body,
-                fields: vec![
-                    Field {
-                        name: "address".into(),
-                        label: "Address".into(),
-                        kind: "string".into(),
-                        help: "Tapo app → the dimmer → Settings → Device Info".into(),
-                        default: (!address.is_empty()).then(|| json!(address)),
-                        options: Vec::new(),
-                        required: true,
-                    },
-                    Field {
-                        name: "email".into(),
-                        label: "Email".into(),
-                        kind: "string".into(),
-                        help: "the TP-Link account".into(),
-                        default: None,
-                        options: Vec::new(),
-                        required: true,
-                    },
-                    Field {
-                        name: "password".into(),
-                        label: "Password".into(),
-                        kind: "password".into(),
-                        help: "that account's password".into(),
-                        default: None,
-                        options: Vec::new(),
-                        required: true,
-                    },
-                ],
+                fields,
             },
-            json!({ "phase": "credentials", "address": address, "model": model }),
+            json!({
+                "phase": "credentials",
+                "queue": found,
+                // Carried so the walk can still name each device's model, and so a rescan
+                // arriving mid-flow does not have to be looked up twice.
+                "udp_candidates": state.get("udp_candidates").cloned().unwrap_or(Value::Null),
+            }),
         )
     }
 
@@ -1326,25 +1443,228 @@ mod tests {
         assert_eq!(devices[0].properties["Password"], json!(PASSWORD));
     }
 
-    /// A unit that says it speaks something else is refused with the reason, rather than
-    /// adopted and then failing to log in forever.
-    #[test]
-    fn a_device_on_the_old_protocol_is_told_why_not() {
-        let mut reply = vec![0u8; 16];
+    /// Building block for the discovery seed core hands a cold wizard: TP-Link's reply is a
+    /// sixteen-byte vendor header and then JSON.
+    fn broadcast_reply(model: &str, scheme: &str) -> Vec<u8> {
+        let mut reply = vec![0x02, 0x00, 0x00, 0x01, 0x02, 0, 0, 0, 0, 0, 0, 0, 0x46, 0x3c, 0xb5, 0xd3];
         reply.extend_from_slice(
-            br#"{"result":{"device_model":"HS100","mgt_encrypt_schm":{"encrypt_type":"AES"}}}"#,
+            format!(
+                r#"{{"result":{{"device_model":"{model}","mgt_encrypt_schm":{{"encrypt_type":"{scheme}"}}}}}}"#
+            )
+            .as_bytes(),
         );
-        let (step, _) = Tapo.discover(
+        reply
+    }
+
+    /// A unit on an older protocol is left out of the list and named, rather than taking the
+    /// rest of the house down with it.
+    ///
+    /// It used to fail the whole flow, which is right when it is the only device and wrong the
+    /// moment there are eight: one legacy plug on the network must not be the reason seven
+    /// dimmers cannot be added.
+    #[test]
+    fn a_device_on_the_old_protocol_is_left_out_and_named() {
+        let (step, state) = Tapo.discover(
             "tapo.dimmer",
             &json!({
-                "chosen_address": "10.0.0.9",
-                "udp_candidates": [{ "address": "10.0.0.9", "port": 20002, "reply": reply }],
+                "udp_candidates": [
+                    { "address": "10.0.0.4", "port": 20002, "reply": broadcast_reply("S500D", "KLAP") },
+                    { "address": "10.0.0.9", "port": 20002, "reply": broadcast_reply("HS100", "AES") },
+                ],
             }),
             &Args::new(),
         );
-        let SetupStep::Failed { reason } = step else {
-            panic!("expected a refusal, got {step:?}");
+        let SetupStep::Form { body, fields, .. } = &step else {
+            panic!("expected a form, got {step:?}");
         };
-        assert!(reason.contains("AES") && reason.contains("KLAP"), "{reason}");
+        assert!(body.contains("10.0.0.9"), "the excluded one has to be named: {body}");
+        assert!(body.contains("S500D at 10.0.0.4"), "{body}");
+        // Only the usable one is walked.
+        assert_eq!(state["queue"], json!(["10.0.0.4"]));
+        // And nobody is asked for an address that the broadcast already gave.
+        assert!(
+            !fields.iter().any(|f| f.name == "address"),
+            "an address was found, so it must not be asked for"
+        );
+    }
+
+    /// The point of the whole flow: one account, every dimmer, and nobody types an address.
+    #[test]
+    fn one_password_adopts_every_dimmer_the_broadcast_found() {
+        let tapo = Tapo;
+        let auth = klap::auth_hash(EMAIL, PASSWORD);
+
+        let (step, state) = tapo.discover(
+            "tapo.dimmer",
+            &json!({
+                "udp_candidates": [
+                    { "address": "10.0.0.4", "port": 20002, "reply": broadcast_reply("S500D", "KLAP") },
+                    { "address": "10.0.0.5", "port": 20002, "reply": broadcast_reply("S500D", "KLAP") },
+                ],
+            }),
+            &Args::new(),
+        );
+        let SetupStep::Form { title, .. } = &step else {
+            panic!("expected a form, got {step:?}");
+        };
+        assert_eq!(title, "Sign in to 2 dimmers");
+
+        let mut input = Args::new();
+        input.insert("email".into(), json!(EMAIL));
+        input.insert("password".into(), json!(PASSWORD));
+        let (step, mut state) = tapo.setup("tapo.dimmer", &state, &input);
+
+        let fetched = |bytes: &[u8], cookie: bool| {
+            let mut a = Args::new();
+            a.insert("status".into(), json!(200));
+            a.insert("response_bytes".into(), json!(bytes));
+            a.insert(
+                "response_headers".into(),
+                if cookie {
+                    json!([["set-cookie", "TP_SESSIONID=SID;TIMEOUT=1440"]])
+                } else {
+                    json!([])
+                },
+            );
+            a
+        };
+
+        // Walk both devices. Each is a handshake, a login, and one question.
+        let mut step = step;
+        for (i, (address, name)) in [("10.0.0.4", "Hall"), ("10.0.0.5", "Landing")]
+            .into_iter()
+            .enumerate()
+        {
+            let SetupStep::Fetch { request, .. } = &step else {
+                panic!("expected a handshake for {address}, got {step:?}");
+            };
+            assert_eq!(request.url, format!("http://{address}{HANDSHAKE1}"));
+            let local: [u8; 16] = request.body_bytes.clone().try_into().unwrap();
+            let remote = [(i as u8) + 20; 16];
+
+            let (s2, st) = tapo.setup(
+                "tapo.dimmer",
+                &state,
+                &fetched(&hs1_reply(&local, &remote, &auth), true),
+            );
+            let (s3, st) = tapo.setup("tapo.dimmer", &st, &fetched(b"", false));
+            let SetupStep::Fetch { request, .. } = &s3 else {
+                panic!("expected get_device_info, got {s3:?}");
+            };
+            let _ = s2;
+
+            let mut device = klap::Session::derive(&local, &remote, &auth);
+            let seq = device.seq + 1;
+            assert_eq!(
+                device.decrypt(seq, &request.body_bytes).as_deref(),
+                Some(GET.as_bytes())
+            );
+            // The nickname is base64 in the reply, which is how a Tapo sends every set name.
+            let nickname = base64(name);
+            let info = format!(
+                r#"{{"error_code":0,"result":{{"device_on":true,"brightness":60,"nickname":"{nickname}","model":"S500D"}}}}"#
+            );
+            let framed = answer(&mut device, seq, info.as_bytes());
+            let (s4, st) = tapo.setup("tapo.dimmer", &st, &fetched(&framed, false));
+            step = s4;
+            state = st;
+        }
+
+        let SetupStep::Done { devices, .. } = step else {
+            panic!("expected both devices, got {step:?}");
+        };
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].label, "Hall");
+        assert_eq!(devices[1].label, "Landing");
+        // Every one of them carries the account that was typed once.
+        for device in &devices {
+            assert_eq!(device.properties["Email"], json!(EMAIL));
+            assert_eq!(device.properties["Password"], json!(PASSWORD));
+        }
+        assert_eq!(devices[0].properties["Address"], json!("10.0.0.4"));
+        assert_eq!(devices[1].properties["Address"], json!("10.0.0.5"));
+    }
+
+    /// One dimmer being unplugged must not cost the others.
+    #[test]
+    fn a_dead_device_is_skipped_and_the_rest_still_arrive() {
+        let tapo = Tapo;
+        let auth = klap::auth_hash(EMAIL, PASSWORD);
+
+        let (_, state) = tapo.discover(
+            "tapo.dimmer",
+            &json!({
+                "udp_candidates": [
+                    { "address": "10.0.0.4", "port": 20002, "reply": broadcast_reply("S500D", "KLAP") },
+                    { "address": "10.0.0.5", "port": 20002, "reply": broadcast_reply("S500D", "KLAP") },
+                ],
+            }),
+            &Args::new(),
+        );
+        let mut input = Args::new();
+        input.insert("email".into(), json!(EMAIL));
+        input.insert("password".into(), json!(PASSWORD));
+        let (step, state) = tapo.setup("tapo.dimmer", &state, &input);
+
+        // First one answers properly.
+        let SetupStep::Fetch { request, .. } = &step else { panic!("{step:?}") };
+        let local: [u8; 16] = request.body_bytes.clone().try_into().unwrap();
+        let remote = [31u8; 16];
+        let ok = |bytes: &[u8]| {
+            let mut a = Args::new();
+            a.insert("status".into(), json!(200));
+            a.insert("response_bytes".into(), json!(bytes));
+            a.insert("response_headers".into(), json!([["set-cookie", "TP_SESSIONID=S"]]));
+            a
+        };
+        let (_, st) = tapo.setup("tapo.dimmer", &state, &ok(&hs1_reply(&local, &remote, &auth)));
+        let (s3, st) = tapo.setup("tapo.dimmer", &st, &ok(b""));
+        let SetupStep::Fetch { request, .. } = &s3 else { panic!("{s3:?}") };
+        let mut device = klap::Session::derive(&local, &remote, &auth);
+        let seq = device.seq + 1;
+        let _ = device.decrypt(seq, &request.body_bytes);
+        let framed = answer(
+            &mut device,
+            seq,
+            format!(
+                r#"{{"error_code":0,"result":{{"device_on":true,"nickname":"{}","model":"S500D"}}}}"#,
+                base64("Hall")
+            )
+            .as_bytes(),
+        );
+        let (step, st) = tapo.setup("tapo.dimmer", &st, &ok(&framed));
+
+        // The second is unplugged: core reports the failure as a status of nothing.
+        let SetupStep::Fetch { request, .. } = &step else { panic!("{step:?}") };
+        assert!(request.url.contains("10.0.0.5"));
+        let mut dead = Args::new();
+        dead.insert("status".into(), json!(0));
+        dead.insert("error".into(), json!("connection refused"));
+        let (step, _) = tapo.setup("tapo.dimmer", &st, &dead);
+
+        let SetupStep::Done { devices, .. } = step else {
+            panic!("the one that answered is still worth having, got {step:?}");
+        };
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].label, "Hall");
+    }
+
+    /// Base64, for building the nicknames a Tapo would send.
+    fn base64(text: &str) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let bytes = text.as_bytes();
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+            let n = u32::from_be_bytes([0, b[0], b[1], b[2]]);
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(ALPHABET[((n >> (18 - 6 * i)) & 0x3F) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
     }
 }
