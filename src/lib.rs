@@ -226,7 +226,10 @@ impl Tapo {
     fn post(host: &str, path: &str, cookie: Option<&str>, body: Vec<u8>) -> HostCall {
         let mut request = HttpRequest::new("POST", format!("http://{host}{path}")).bytes(body);
         if let Some(id) = cookie {
-            request = request.header("cookie", format!("TP_SESSIONID={id}"));
+            // Header names are case-insensitive in HTTP, but current S500D firmware rejects the
+            // lowercase spelling as a malformed request. Core's binary HTTP/1 compatibility
+            // path preserves this conventional spelling for exactly that firmware defect.
+            request = request.header("Cookie", format!("TP_SESSIONID={id}"));
         }
         HostCall::Http(request)
     }
@@ -587,10 +590,17 @@ impl Tapo {
         match phase {
             "start" if driver_id == "tapo.dimmer" => {
                 // One dimmer, on its own. The account it belongs to is already set up — that is
-                // what `parent` guarantees — so there is nothing to ask but which one.
+                // what `parent` guarantees. When core can resolve that one parent it includes
+                // the inherited credentials in this setup seed, so authenticate and replace the
+                // broadcast's model/MAC fallback with the name from the Tapo app before adoption.
                 let found = Self::discovered(state);
                 match s("chosen_address").or_else(|| found.first().cloned()) {
-                    Some(address) => Self::one_dimmer(state, &address),
+                    Some(address) => match (s("Email"), s("Password")) {
+                        (Some(email), Some(password)) => {
+                            Self::walk(state, vec![address], &email, &password)
+                        }
+                        _ => Self::one_dimmer(state, &address),
+                    },
                     None => (
                         SetupStep::Form {
                             title: "Add a dimmer".into(),
@@ -693,21 +703,35 @@ impl Tapo {
                     return Self::lost();
                 };
                 if status() != 200 {
-                    return Self::skip(state, at, format!("{here} did not answer"));
+                    let code = status();
+                    let detail = input
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|error| !error.is_empty())
+                        .map(|error| format!(": {error}"))
+                        .unwrap_or_default();
+                    return Self::skip(
+                        state,
+                        at,
+                        format!("{here} did not answer (HTTP {code}){detail}"),
+                    );
                 }
                 let auth = klap::auth_hash(&email, &password);
                 let Some(remote) = klap::accept_handshake1(&seed, &auth, &received()) else {
                     return Self::skip(
                         state,
                         at,
-                        format!("{here} is paired to a different TP-Link account"),
+                        format!(
+                            "{here} did not accept the saved TP-Link email/password — edit the account credentials and try again"
+                        ),
                     );
                 };
                 let cookie = setup_cookie(input).unwrap_or_default();
                 let mut request = HttpRequest::new("POST", format!("http://{here}{HANDSHAKE2}"))
                     .bytes(klap::handshake2(&seed, &remote, &auth).to_vec());
                 if !cookie.is_empty() {
-                    request = request.header("cookie", format!("TP_SESSIONID={cookie}"));
+                    request = request.header("Cookie", format!("TP_SESSIONID={cookie}"));
                 }
                 let mut next = state.clone();
                 next["phase"] = json!("hs2");
@@ -718,7 +742,11 @@ impl Tapo {
 
             "hs2" => {
                 if status() != 200 {
-                    return Self::skip(state, at, format!("{here} rejected the login"));
+                    return Self::skip(
+                        state,
+                        at,
+                        format!("{here} rejected the login (HTTP {})", status()),
+                    );
                 }
                 let (Some(local), Some(remote), Some(email), Some(password)) = (
                     s("local_seed").and_then(|h| unhex(&h)),
@@ -742,7 +770,7 @@ impl Tapo {
                     HttpRequest::new("POST", format!("http://{here}{REQUEST}?seq={seq}"))
                         .bytes(framed);
                 if !cookie.is_empty() {
-                    request = request.header("cookie", format!("TP_SESSIONID={cookie}"));
+                    request = request.header("Cookie", format!("TP_SESSIONID={cookie}"));
                 }
                 let mut next = state.clone();
                 next["phase"] = json!("info");
@@ -1514,7 +1542,7 @@ mod tests {
         let SetupStep::Failed { reason } = step else {
             panic!("expected a refusal, got {step:?}");
         };
-        assert!(reason.contains("different TP-Link account"), "{reason}");
+        assert!(reason.contains("saved TP-Link email/password"), "{reason}");
     }
 
     /// The bug somebody actually hit:    /// The bug somebody actually hit: a form submitted with a field empty redisplayed itself
@@ -1622,6 +1650,20 @@ mod tests {
     #[test]
     fn a_dimmer_added_on_its_own_is_never_asked_for_a_password() {
         let tapo = Tapo;
+        let seeded = json!({
+            "chosen_address": "10.0.0.4",
+            "Email": EMAIL,
+            "Password": PASSWORD,
+            "udp_candidates": seen(&[("10.0.0.4", "S500D", "KLAP")])["udp_candidates"],
+        });
+        let (step, _) = tapo.discover("tapo.dimmer", &seeded, &Args::new());
+        let SetupStep::Fetch { request, .. } = step else {
+            panic!("expected the inherited account to be used, got {step:?}");
+        };
+        assert!(request.url.contains("10.0.0.4/app/handshake1"), "{}", request.url);
+
+        // A legacy core that did not seed the parent still gets the previous safe behavior:
+        // adopt the discovered address and inherit credentials when the device is attached.
         let (step, _) = tapo.discover(
             "tapo.dimmer",
             &json!({
