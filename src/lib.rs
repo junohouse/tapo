@@ -168,9 +168,10 @@ impl DriverModule for Tapo {
         if note != "http_response" {
             return Vec::new();
         }
-        let Some(host) = Self::host(inst) else {
+        // A reply for a device whose address has since been cleared is not ours to act on.
+        if Self::host(inst).is_none() {
             return Vec::new();
-        };
+        }
         let url = args.get("url").and_then(Value::as_str).unwrap_or("").to_string();
         let status = args.get("status").and_then(Value::as_u64).unwrap_or(0) as u16;
         // `bytes` rather than `body` because the request declared itself binary — see
@@ -183,11 +184,11 @@ impl DriverModule for Tapo {
             .unwrap_or_default();
 
         if url.contains(HANDSHAKE1) {
-            Self::on_handshake1(inst, &host, status, &body, args)
+            Self::on_handshake1(inst, status, &body, args)
         } else if url.contains(HANDSHAKE2) {
-            Self::on_handshake2(inst, &host, status)
+            Self::on_handshake2(inst, status)
         } else if url.contains(REQUEST) {
-            Self::on_result(inst, &host, status, &body)
+            Self::on_result(inst, status, &body)
         } else {
             Vec::new()
         }
@@ -223,8 +224,10 @@ impl Tapo {
     }
 
     /// One POST, with the session cookie if there is one yet.
-    fn post(host: &str, path: &str, cookie: Option<&str>, body: Vec<u8>) -> HostCall {
-        let mut request = HttpRequest::new("POST", format!("http://{host}{path}")).bytes(body);
+    /// The path only: core resolves it against this device's address. The setup flow still
+    /// writes absolute URLs, because it runs before there is a device to resolve against.
+    fn post(path: &str, cookie: Option<&str>, body: Vec<u8>) -> HostCall {
+        let mut request = HttpRequest::new("POST", path).bytes(body);
         if let Some(id) = cookie {
             // Header names are case-insensitive in HTTP, but current S500D firmware rejects the
             // lowercase spelling as a malformed request. Core's binary HTTP/1 compatibility
@@ -236,9 +239,9 @@ impl Tapo {
 
     /// Put one request on the wire, or hold it until there is a session to put it on.
     fn request(inst: &mut Instance, body: String) -> Vec<HostCall> {
-        let Some(host) = Self::host(inst) else {
+        if Self::host(inst).is_none() {
             return vec![HostCall::warn("tapo: set the Address on this dimmer first")];
-        };
+        }
         if Self::auth(inst).is_none() {
             return vec![HostCall::warn(
                 "tapo: set the Email and Password on this dimmer first — local control is \
@@ -252,22 +255,22 @@ impl Tapo {
             // No session and nothing on its way to getting one: this is the request that
             // starts the handshake. Mid-handshake, the queue is enough.
             return if !ready && !busy {
-                Self::handshake(inst, &host)
+                Self::handshake(inst)
             } else {
                 Vec::new()
             };
         }
-        Self::wire(inst, &host, body)
+        Self::wire(inst, body)
     }
 
     /// Encrypt and send. The session is re-read from scratch each time because a reply may
     /// have replaced it since the last one.
-    fn wire(inst: &mut Instance, host: &str, body: String) -> Vec<HostCall> {
+    fn wire(inst: &mut Instance, body: String) -> Vec<HostCall> {
         let Some(mut session) = Self::session(inst) else {
             // `ready` without a session is not a state that should happen; treating it as "no
             // session" rather than dropping the request is the recovery.
             Self::push(inst, body);
-            return Self::handshake(inst, host);
+            return Self::handshake(inst);
         };
         let (seq, framed) = session.encrypt(body.as_bytes());
         Self::save_session(inst, &session);
@@ -275,25 +278,23 @@ impl Tapo {
         inst.scratch.insert(LAST.into(), json!(body));
         let cookie = inst.scratch.get(COOKIE).and_then(Value::as_str).map(str::to_string);
         vec![Self::post(
-            host,
             &format!("{REQUEST}?seq={seq}"),
             cookie.as_deref(),
             framed,
         )]
     }
 
-    fn handshake(inst: &mut Instance, host: &str) -> Vec<HostCall> {
+    fn handshake(inst: &mut Instance) -> Vec<HostCall> {
         let seed = klap::local_seed();
         inst.scratch.insert(LOCAL_SEED.into(), json!(hex(&seed)));
         inst.scratch.insert(INFLIGHT.into(), json!(true));
         inst.scratch.insert(READY.into(), json!(false));
         inst.scratch.remove(COOKIE);
-        vec![Self::post(host, HANDSHAKE1, None, seed.to_vec())]
+        vec![Self::post(HANDSHAKE1, None, seed.to_vec())]
     }
 
     fn on_handshake1(
         inst: &mut Instance,
-        host: &str,
         status: u16,
         body: &[u8],
         args: &Args,
@@ -330,23 +331,22 @@ impl Tapo {
         inst.scratch.insert(INFLIGHT.into(), json!(true));
         let cookie = inst.scratch.get(COOKIE).and_then(Value::as_str).map(str::to_string);
         vec![Self::post(
-            host,
             HANDSHAKE2,
             cookie.as_deref(),
             klap::handshake2(&seed, &remote, &auth).to_vec(),
         )]
     }
 
-    fn on_handshake2(inst: &mut Instance, host: &str, status: u16) -> Vec<HostCall> {
+    fn on_handshake2(inst: &mut Instance, status: u16) -> Vec<HostCall> {
         inst.scratch.insert(INFLIGHT.into(), json!(false));
         if status != 200 {
             return Self::give_up(inst, format!("tapo: the dimmer rejected the login ({status})"));
         }
         inst.scratch.insert(READY.into(), json!(true));
-        Self::flush(inst, host)
+        Self::flush(inst)
     }
 
-    fn on_result(inst: &mut Instance, host: &str, status: u16, body: &[u8]) -> Vec<HostCall> {
+    fn on_result(inst: &mut Instance, status: u16, body: &[u8]) -> Vec<HostCall> {
         inst.scratch.insert(INFLIGHT.into(), json!(false));
         let sent = inst.scratch.get(LAST).and_then(Value::as_str).unwrap_or("").to_string();
 
@@ -357,7 +357,7 @@ impl Tapo {
             if !sent.is_empty() {
                 Self::push(inst, sent);
             }
-            return Self::handshake(inst, host);
+            return Self::handshake(inst);
         }
 
         let Some(session) = Self::session(inst) else {
@@ -376,7 +376,7 @@ impl Tapo {
                 Self::push(inst, sent);
             }
             let mut out = vec![HostCall::warn("tapo: could not read the reply; reconnecting")];
-            out.extend(Self::handshake(inst, host));
+            out.extend(Self::handshake(inst));
             return out;
         };
 
@@ -389,12 +389,12 @@ impl Tapo {
                 if !sent.is_empty() {
                     Self::push(inst, sent);
                 }
-                out.extend(Self::handshake(inst, host));
+                out.extend(Self::handshake(inst));
                 return out;
             }
             code => out.push(HostCall::warn(format!("tapo: the dimmer refused that ({code})"))),
         }
-        out.extend(Self::flush(inst, host));
+        out.extend(Self::flush(inst));
         out
     }
 
@@ -454,14 +454,14 @@ impl Tapo {
     }
 
     /// Send the next queued request, if the session is idle.
-    fn flush(inst: &mut Instance, host: &str) -> Vec<HostCall> {
+    fn flush(inst: &mut Instance) -> Vec<HostCall> {
         if inst.scratch.get(READY).and_then(Value::as_bool) != Some(true)
             || inst.scratch.get(INFLIGHT).and_then(Value::as_bool) == Some(true)
         {
             return Vec::new();
         }
         match Self::pop(inst) {
-            Some(body) => Self::wire(inst, host, body),
+            Some(body) => Self::wire(inst, body),
             None => Vec::new(),
         }
     }
@@ -1255,7 +1255,9 @@ mod tests {
         // -- bind: nothing is known, so this has to start with a handshake ------------------
         let calls = tapo.on_bind(&mut inst);
         let (url, body) = sent(&calls);
-        assert_eq!(url, "http://10.0.0.4/app/handshake1");
+        // Relative: core resolves it against this dimmer's address. The setup flow's own
+        // requests stay absolute, because they run before the device exists.
+        assert_eq!(url, "/app/handshake1");
         let local: [u8; 16] = body.try_into().expect("a 16-byte seed");
 
         let remote = [3u8; 16];
@@ -1266,7 +1268,7 @@ mod tests {
             &answered(&url, 200, &hs1_reply(&local, &remote, &auth), true),
         );
         let (url, body) = sent(&calls);
-        assert_eq!(url, "http://10.0.0.4/app/handshake2");
+        assert_eq!(url, "/app/handshake2");
         assert_eq!(body, klap::handshake2(&local, &remote, &auth));
 
         // -- the session is up, so the bind's own question goes out ------------------------
@@ -1274,7 +1276,7 @@ mod tests {
         let mut seq = device.seq + 1;
         let calls = tapo.on_event(&mut inst, 0, "http_response", &answered(&url, 200, b"", false));
         let (url, body) = sent(&calls);
-        assert_eq!(url, format!("http://10.0.0.4/app/request?seq={seq}"));
+        assert_eq!(url, format!("/app/request?seq={seq}"));
         assert_eq!(
             device.decrypt(seq, &body).as_deref(),
             Some(GET.as_bytes()),
@@ -1309,7 +1311,7 @@ mod tests {
         assert!(notified(&calls, "power_changed").is_none(), "nothing was read back yet");
         let (url, body) = sent(&calls);
         seq += 1;
-        assert_eq!(url, format!("http://10.0.0.4/app/request?seq={seq}"));
+        assert_eq!(url, format!("/app/request?seq={seq}"));
         assert_eq!(device.decrypt(seq, &body).as_deref(), Some(GET.as_bytes()));
 
         let framed = answer(
@@ -1348,7 +1350,7 @@ mod tests {
         // The switch rebooted between the handshake and now.
         let calls = tapo.on_event(&mut inst, 0, "http_response", &answered(&url, 403, b"", false));
         let (url, _) = sent(&calls);
-        assert_eq!(url, "http://10.0.0.4/app/handshake1", "a 403 means handshake again");
+        assert_eq!(url, "/app/handshake1", "a 403 means handshake again");
 
         // And after the new handshake the question that was refused goes out again.
         let (_, body) = sent(&calls);
