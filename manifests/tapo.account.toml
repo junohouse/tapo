@@ -4,6 +4,10 @@ name = "TP-Link Account"
 manufacturer = "TP-Link"
 version = "1.0.0"
 runtime = "wasm"
+# What this driver is worth hearing when nothing is wrong. Declaring it is also what lets an
+# installer change it from the Logs page; a driver that declares nothing sits at `info` with
+# no control. Everything it prints rather than logs is taken as `debug` and held to this too.
+log_level = "info"
 # Names the package. The dimmers are what somebody actually wanted, but this is what has to
 # exist first, and a catalog should lead with the thing you install.
 primary = true

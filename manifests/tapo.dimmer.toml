@@ -4,6 +4,10 @@ name = "Tapo Dimmer Switch"
 manufacturer = "TP-Link"
 version = "1.0.0"
 runtime = "wasm"
+# What this driver is worth hearing when nothing is wrong. Declaring it is also what lets an
+# installer change it from the Logs page; a driver that declares nothing sits at `info` with
+# no control. Everything it prints rather than logs is taken as `debug` and held to this too.
+log_level = "info"
 # Behind the account, exactly as a Hue bulb is behind its bridge, and for the same reason: the
 # credentials every dimmer needs are one account's and belong in one place. `Email` and
 # `Password` are therefore *not* properties here — they are inherited, and a driver reads them
