@@ -30,7 +30,6 @@ capabilities = { dimmer = true, min_on_level = 1, max_on_level = 100 }
 # neither the request nor the discovery could be expressed any other way — see the README.
 [[transport]]
 kind = "network"
-port = 80
 
 [[property]]
 name = "Address"
