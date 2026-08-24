@@ -32,8 +32,10 @@ capabilities = { dimmer = true, min_on_level = 1, max_on_level = 100 }
 # A network device on port 80, and nothing more than that: KLAP goes out as `HostCall::Http`,
 # which core owns end to end. This block used to declare `binary` and carry a `probe`, because
 # neither the request nor the discovery could be expressed any other way — see the README.
-[[transport]]
+[[control]]
+id = 1
 kind = "network"
+name = "Tapo cloud"
 port = 80
 
 [[property]]
