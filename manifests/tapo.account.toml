@@ -3,6 +3,11 @@ id = "tapo.account"
 name = "TP-Link Account"
 manufacturer = "TP-Link"
 version = "1.0.0"
+# The lead driver is a cloud login, which is neither what somebody bought nor what it does.
+# The names in this package agree on nothing — `TP-Link Account` and `Tapo Dimmer Switch` — so
+# unlike Hue there is no family name to fall back on, and it has to be said.
+product = "TP-Link Tapo"
+kind = "light"
 runtime = "wasm"
 # What this driver is worth hearing when nothing is wrong. Declaring it is also what lets an
 # installer change it from the Logs page; a driver that declares nothing sits at `info` with
