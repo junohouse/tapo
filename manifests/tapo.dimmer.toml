@@ -17,8 +17,11 @@ parent = "tapo.account"
 # One load, dimmed. `supports_ramp` is deliberately absent: the switch has a fade time, but it
 # is a setting stored on the device rather than something a single command can carry, so a
 # `ramp_ms` accepted here would be quietly ignored — which is the failure that flag exists to
-# prevent. `has_button_events` likewise: the paddle works, and nothing local reports that it
-# was pressed, so a rule triggered on a press would never fire.
+# prevent. Leaving it out is what keeps `ramp_start`/`ramp_stop` and the fade box off this
+# dimmer's pane entirely, rather than drawing controls that can only warn.
+#
+# `has_button_events` likewise: the paddle works, and nothing local reports that it was
+# pressed, so a rule triggered on a press would never fire.
 #
 # 1 rather than 0 for `min_on_level` because that is what the hardware takes — `brightness: 0`
 # is refused, and off is `device_on: false`. See `set_level` in the driver.
