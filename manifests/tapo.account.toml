@@ -2,6 +2,10 @@
 id = "tapo.account"
 name = "TP-Link Account"
 manufacturer = "TP-Link"
+# The maker's mark, linked and never copied — this package ships no TP-Link artwork. Core
+# dereferences it once for the whole house (`GET /artwork?driver=<id>`) and every screen
+# draws the same picture: the phone, the on-screen display and the wall panel.
+icon = "https://static.tp-link.com/assets/images/icon/favicon-152px.png"
 version = "1.0.0"
 # The lead driver is a cloud login, which is neither what somebody bought nor what it does.
 # The names in this package agree on nothing — `TP-Link Account` and `Tapo Dimmer Switch` — so
