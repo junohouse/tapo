@@ -33,7 +33,10 @@ parent = "tapo.account"
 id = 1
 type = "light"
 primary = true
-name = "Dimmer"
+# No `name`. A proxy name becomes the binding's name, and with one load per device that means
+# every dimmer in the house is called "Dimmer" on every screen instead of what somebody named
+# it. The name belongs to the device; a proxy only needs one where a device has several and
+# they have to be told apart — a television's screen and its player.
 capabilities = { dimmer = true, min_on_level = 1, max_on_level = 100 }
 
 # A network device on port 80, and nothing more than that: KLAP goes out as `HostCall::Http`,

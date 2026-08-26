@@ -70,6 +70,11 @@ const LAST: &str = "last";
 /// Last brightness and power the switch reported, for `toggle` and for not re-notifying.
 const LEVEL: &str = "level";
 const ON: &str = "on";
+/// The brightness the switch will return to when it is turned back on, which is not the same
+/// fact as how bright it is now — see `apply`.
+const REMEMBERED: &str = "remembered";
+/// Set at every bind: the next reply states everything rather than only what changed.
+const RESTATE: &str = "restate";
 /// A `toggle` that arrived before anything knew which way to go. Cleared by the read it is
 /// waiting for.
 const AFTER_READ: &str = "after_read";
@@ -101,6 +106,8 @@ impl DriverModule for Tapo {
         // the command that queued it, and a light that turns on by itself long after somebody
         // gave up on the switch is worse than one that did nothing.
         inst.scratch.remove(QUEUE);
+        // Say everything next time, not just what moved — see `apply`.
+        inst.scratch.insert(RESTATE.into(), json!(true));
         // The session is kept: it may well still be good, and if the switch has forgotten it
         // the reply says so and the handshake happens then.
         Self::request(inst, GET.into())
@@ -425,22 +432,48 @@ impl Tapo {
         // that. Say so when it plainly is reachable, and leave the other half alone.
         out.push(HostCall::notify(LIGHT, "online_changed", online));
 
-        // Both, because this hardware genuinely keeps them apart: a Tapo remembers the
-        // brightness it will return to while it is off, so "brightness 40, off" is a real
-        // state and core's derivation of `on` from `level` cannot express it. Sending
-        // `power_changed` is what tells core to stop deriving it — see the light contract.
-        if inst.scratch.get(ON).and_then(Value::as_bool) != Some(on) {
+        // A bind is "tell me where you stand", and the answer has to be said in full.
+        //
+        // Everything below reports only what changed, measured against this driver's own
+        // scratch. That is right between polls and wrong the moment a bind happens, because
+        // scratch and core's state are persisted separately and can disagree: a controller that
+        // came back with scratch saying `on: false` and state saying otherwise would compare
+        // the reply against scratch, find nothing changed, and say nothing — leaving the screen
+        // showing what it had before, for ever. So the first reply after a bind states
+        // everything and the ones after it state differences.
+        let restating = inst.scratch.remove(RESTATE).is_some();
+
+        // Power and brightness are separate facts here, and both are said outright. A Tapo
+        // remembers the brightness it will return to while it is off, so the switch reports
+        // `brightness: 40` for a light that is dark — and reporting that as the level is what
+        // put "on, 100%" on a phone screen for a light somebody had turned off.
+        if restating || inst.scratch.get(ON).and_then(Value::as_bool) != Some(on) {
             let mut a = Args::new();
             a.insert("on".into(), json!(on));
             out.push(HostCall::notify(LIGHT, "power_changed", a));
         }
-        if let Some(level) = level
-            && inst.scratch.get(LEVEL).and_then(Value::as_u64) != Some(level)
-        {
+
+        // `level` is how bright the light is *now*, so a light that is off is at zero. The
+        // brightness it will come back at is a different fact and goes in its own key, which is
+        // the shape every other dimmable light in the house already reports and the shape the
+        // screens already read.
+        let shown = if on { level.unwrap_or(0) } else { 0 };
+        if restating || inst.scratch.get(LEVEL).and_then(Value::as_u64) != Some(shown) {
             let mut a = Args::new();
-            a.insert("level".into(), json!(level));
+            a.insert("level".into(), json!(shown));
             out.push(HostCall::notify(LIGHT, "level_changed", a));
-            inst.scratch.insert(LEVEL.into(), json!(level));
+        }
+        inst.scratch.insert(LEVEL.into(), json!(shown));
+
+        // What it will return to. Kept whether it is on or off, because that is exactly the
+        // value a slider should show for a light that is currently dark.
+        if let Some(level) = level {
+            inst.scratch.insert(REMEMBERED.into(), json!(level));
+            out.push(HostCall::SetState {
+                proxy: LIGHT,
+                key: "brightness".into(),
+                value: json!(level),
+            });
         }
         inst.scratch.insert(ON.into(), json!(on));
 
@@ -1321,8 +1354,71 @@ mod tests {
         );
         let calls = tapo.on_event(&mut inst, 0, "http_response", &answered(&url, 200, &framed, false));
         assert_eq!(notified(&calls, "power_changed").unwrap().get("on"), Some(&json!(false)));
-        // The brightness did not move, so nothing claims it did.
-        assert!(notified(&calls, "level_changed").is_none());
+        // A light that is off is at zero, whatever brightness the switch is holding for later.
+        // Reporting the held value as the level is what drew "on, 100%" on a phone for a light
+        // somebody had just switched off.
+        assert_eq!(
+            notified(&calls, "level_changed").unwrap().get("level"),
+            Some(&json!(0))
+        );
+        // And the brightness it will come back at is still said, under its own key.
+        let remembered = calls.iter().find_map(|c| match c {
+            HostCall::SetState { key, value, .. } if key == "brightness" => Some(value.clone()),
+            _ => None,
+        });
+        assert_eq!(remembered, Some(json!(40)), "the slider still has something to show");
+    }
+
+    /// A bind states everything, not only what moved since the driver last looked.
+    ///
+    /// The two sides persist separately: this driver's scratch and core's state are written to
+    /// different places and restored independently, so a controller can come back with them
+    /// disagreeing. Reporting only differences then means the disagreement is permanent — the
+    /// driver compares the switch's answer against its own scratch, finds nothing changed, and
+    /// says nothing, leaving the screen showing whatever it had before.
+    #[test]
+    fn a_bind_says_everything_even_when_nothing_has_moved() {
+        let tapo = Tapo;
+        let mut inst = dimmer();
+        let auth = klap::auth_hash(EMAIL, PASSWORD);
+
+        // Scratch that already knows exactly what the switch is about to say.
+        inst.scratch.insert("on".into(), json!(true));
+        inst.scratch.insert("level".into(), json!(60));
+
+        let calls = tapo.on_bind(&mut inst);
+        let (url, body) = sent(&calls);
+        let local: [u8; 16] = body.try_into().unwrap();
+        let remote = [42u8; 16];
+        let calls = tapo.on_event(
+            &mut inst,
+            0,
+            "http_response",
+            &answered(&url, 200, &hs1_reply(&local, &remote, &auth), true),
+        );
+        let (url, _) = sent(&calls);
+        let calls = tapo.on_event(&mut inst, 0, "http_response", &answered(&url, 200, b"", false));
+        let (url, _) = sent(&calls);
+
+        let mut device = klap::Session::derive(&local, &remote, &auth);
+        let seq = device.seq + 1;
+        let framed = answer(
+            &mut device,
+            seq,
+            br#"{"error_code":0,"result":{"device_on":true,"brightness":60}}"#,
+        );
+        let calls = tapo.on_event(&mut inst, 0, "http_response", &answered(&url, 200, &framed, false));
+
+        assert_eq!(
+            notified(&calls, "power_changed").unwrap().get("on"),
+            Some(&json!(true)),
+            "a bind restates power even though scratch already said so"
+        );
+        assert_eq!(
+            notified(&calls, "level_changed").unwrap().get("level"),
+            Some(&json!(60)),
+            "and brightness, for the same reason"
+        );
     }
 
     /// A session the switch has forgotten is rebuilt, and the command that found out is not
